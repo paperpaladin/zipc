@@ -89,6 +89,52 @@ def cmd_extract(path, dest):
     out('OK')
 
 
+def cmd_parse_zipinfo():
+    """Turn `zipinfo -v` on stdin into the same tab-separated form cmd_info
+    prints, so Info-ZIP's view of every member can be diffed against both
+    zipc's and zipfile's.  Parsing is not shelling out: the oracle stays
+    Info-ZIP, this only reshapes what it said.
+    """
+    methods = {'none (stored)': 0, 'deflated': 8}
+    cur, rows, want_name, started = None, [], False, False
+    for line in sys.stdin:
+        line = line.rstrip('\n')
+        if line.startswith('Central directory entry #'):
+            if cur:
+                rows.append(cur)
+            cur, want_name, started = {}, False, True
+            continue
+        if not started:
+            continue        # the EOCD section has a '---' rule of its own
+        if line.startswith('---') and cur == {}:
+            want_name = True
+            continue
+        s = line.strip()
+        if want_name and s:
+            cur['name'] = s
+            want_name = False
+            continue
+        if ':' not in s:
+            continue
+        k, _, val = s.partition(':')
+        val = val.strip()
+        if k == 'offset of local header from start of archive':
+            cur['off'] = int(val)
+        elif k == 'compression method':
+            cur['method'] = methods.get(val, methods.get(val.split(' (')[0], -1))
+        elif k == '32-bit CRC value (hex)':
+            cur['crc'] = int(val, 16)
+        elif k == 'compressed size':
+            cur['csize'] = int(val.split()[0])
+        elif k == 'uncompressed size':
+            cur['usize'] = int(val.split()[0])
+    if cur:
+        rows.append(cur)
+    for r in sorted(rows, key=lambda r: r['name']):
+        out('%s\t%d\t%u\t%d\t%d\t%d' % (r['name'], r['method'], r['crc'],
+                                        r['csize'], r['usize'], r['off']))
+
+
 # ------------------------------------------------------------------ writing
 
 def _members(tree):
@@ -328,6 +374,16 @@ def _patch_sizes(path, member, usize=None, csize=None, crc=None):
     open(path, 'wb').write(bytes(data))
 
 
+def cmd_corrupt_cd_sig(src, dst):
+    """Break the first central directory entry's signature."""
+    b = bytearray(open(src, 'rb').read())
+    i = b.find(b'PK\x01\x02')
+    assert i >= 0
+    b[i + 1] = 0x5a
+    open(dst, 'wb').write(bytes(b))
+    out('OK')
+
+
 def craft_crc_bad(path):
     _raw(path, [('good.txt', b'hello world\n', 8)])
     _patch_sizes(path, 'good.txt', crc=0xdeadbeef)
@@ -431,7 +487,8 @@ def cmd_tree(d):
 # ------------------------------------------------------------------ dispatch
 
 def main(argv):
-    cmds = {k[4:]: v for k, v in globals().items() if k.startswith('cmd_')}
+    cmds = {k[4:].replace('_', '-'): v
+            for k, v in globals().items() if k.startswith('cmd_')}
     if len(argv) < 2 or argv[1] not in cmds:
         sys.exit('usage: oracle.py {%s} [args...]' % '|'.join(sorted(cmds)))
     cmds[argv[1]](*argv[2:])

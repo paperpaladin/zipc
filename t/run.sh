@@ -52,8 +52,7 @@ echo hi >"$TMP/s/a.txt"
 echo there >"$TMP/s/sub/b.txt"
 (cd "$TMP" && zip -q -r plain.zip s)
 
-eocd() { "$ZIPC" -tvf "$1" 2>&1 | head -1; }
-nent() { "$ZIPC" -tf "$1" 2>&1 | head -1; }
+nent() { "$ZIPC" -tf "$1" 2>/dev/null | wc -l; }
 
 assert "zip wrote something unzip likes" unzip -t "$TMP/plain.zip"
 eq "EOCD: entry count matches unzip" "$(nent "$TMP/plain.zip")" \
@@ -102,6 +101,46 @@ eq "EOCD: empty file exits 2" "$?" 2
 printf 'PK\005\006' >"$TMP/sigonly.bin"
 "$ZIPC" -tf "$TMP/sigonly.bin" >/dev/null 2>&1
 eq "EOCD: a bare signature exits 2" "$?" 2
+
+# --------------------------------------------------------------------- #
+# 2. the central directory, three implementations compared               #
+# --------------------------------------------------------------------- #
+# zipc -tvv, zipfile and zipinfo -v all print name/method/crc/csize/usize/
+# local-header-offset.  Diffing all three against each other is the point:
+# any two agreeing could be two readings of the same wrong idea.
+zi_info() { zipinfo -v "$1" | python3 "$ORACLE" parse-zipinfo; }
+zc_info() { "$ZIPC" -tvvf "$1" | LC_ALL=C sort; }
+py_info() { python3 "$ORACLE" info "$1" | LC_ALL=C sort; }
+
+cd_agree() {
+	local tag=$1 z=$2
+	zc_info "$z" >"$TMP/zc.txt" 2>"$TMP/zc.err"
+	py_info "$z" >"$TMP/py.txt" 2>/dev/null
+	zi_info "$z" >"$TMP/zi.txt" 2>/dev/null
+	assert "$tag: central directory, zipc == zipfile" \
+		diff -u "$TMP/py.txt" "$TMP/zc.txt"
+	assert "$tag: central directory, zipc == zipinfo -v" \
+		diff -u "$TMP/zi.txt" "$TMP/zc.txt"
+}
+
+for how in 0 1 9; do
+	(cd "$TMP" && rm -f "cd$how.zip" && zip -q "-$how" -r "cd$how.zip" s)
+	cd_agree "zip -$how" "$TMP/cd$how.zip"
+done
+(cd "$TMP" && rm -f cdX.zip && zip -q -X -r cdX.zip s)
+cd_agree "zip -X" "$TMP/cdX.zip"
+
+# -t with no -v is just names, and must equal zipfile's.
+"$ZIPC" -tf "$TMP/cd9.zip" | LC_ALL=C sort >"$TMP/zc.names"
+python3 "$ORACLE" names "$TMP/cd9.zip" | LC_ALL=C sort >"$TMP/py.names"
+assert "names: zipc == zipfile" diff -u "$TMP/py.names" "$TMP/zc.names"
+eq "names: member count" "$(wc -l <"$TMP/zc.names")" 4
+
+# An entry whose signature is wrong: the directory is not optional structure,
+# so this is exit 2 and not a skipped member.
+python3 "$ORACLE" corrupt-cd-sig "$TMP/cd9.zip" "$TMP/cdsig.zip" >/dev/null
+"$ZIPC" -tf "$TMP/cdsig.zip" >/dev/null 2>&1
+eq "central dir: a wrong entry signature exits 2" "$?" 2
 
 # --------------------------------------------------------------------- #
 echo

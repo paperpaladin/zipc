@@ -351,6 +351,197 @@ static void find_end(End *e)
 		    (unsigned long long)e->nent, (unsigned long long)e->cdsize);
 }
 
+/* ========================== the central directory ======================= */
+
+/* One member, as the central directory describes it.  Every number used to
+ * extract comes from here and nowhere else; see invariant 1 in PLAN.md. */
+typedef struct {
+	char *name;
+	uint64_t usize, csize, localoff;
+	uint32_t crc, extattr;
+	unsigned method, flags, dostime, dosdate;
+	int zip64;		/* a Zip64 extra field supplied one of the above */
+	int isdir;
+} Ent;
+
+#define F_ENCRYPTED 0x0001u
+#define F_DATADESC  0x0008u
+
+/* ZIP's name field is length-counted, so a name may contain a NUL -- at which
+ * point every C string in this program, and in every other extractor, means
+ * something different from what the archive says.  "good\0/../escape" is the
+ * attack: a checker that stops at the NUL sees a clean name and an opener
+ * that does not sees the traversal.  Refuse the ambiguity. */
+static int name_ok(const uint8_t *p, unsigned n)
+{
+	return !memchr(p, 0, n);
+}
+
+/* Walk an extra-field block: a sequence of (id:u16, size:u16, data).  Only
+ * 0x0001, the Zip64 record, is interpreted.  Its fields are present only for
+ * the 32-bit fields that were saturated, in the order uncompressed size,
+ * compressed size, local header offset, disk number -- so the amount of data
+ * is not fixed and a short field is not an error, it is the normal case. */
+static void read_extra(Ent *t, uint64_t off, unsigned n,
+		       int sat_u, int sat_c, int sat_o)
+{
+	while (n >= 4) {
+		unsigned id = r16(off), sz = r16(off + 2);
+		if (sz > n - 4u)
+			break;	/* a field claiming more than the block holds */
+		if (id == 0x0001) {
+			uint64_t q = off + 4;
+			unsigned left = sz;
+			t->zip64 = 1;
+			/* Info-ZIP and Python both write all of usize+csize in
+			 * the local header even when only one was saturated,
+			 * so "saturated" is a hint and "is there room" is the
+			 * rule.  Taking only the saturated ones would misread
+			 * every archive zip -9 produces over 4 GB. */
+			if (sat_u && left >= 8) {
+				t->usize = r64(q);
+				q += 8;
+				left -= 8;
+			}
+			if (sat_c && left >= 8) {
+				t->csize = r64(q);
+				q += 8;
+				left -= 8;
+			}
+			if (sat_o && left >= 8) {
+				t->localoff = r64(q);
+				q += 8;
+				left -= 8;
+			}
+		}
+		off += 4 + sz;
+		n -= 4 + sz;
+	}
+}
+
+/* Parses the whole central directory.  Returns a malloc'd array of e->nent. */
+static Ent *read_cd(const End *e)
+{
+	Ent *v = xmalloc((e->nent ? (size_t)e->nent : 1) * sizeof *v);
+	uint64_t p = e->cdoff, end = e->cdoff + e->cdsize;
+
+	for (uint64_t i = 0; i < e->nent; i++) {
+		if (p + 46 > end)
+			bad("central directory entry %llu starts past the end "
+			    "of the directory", (unsigned long long)i);
+		if (r32(p) != SIG_CENT)
+			bad("central directory entry %llu has signature "
+			    "0x%08x, expected 0x02014b50",
+			    (unsigned long long)i, r32(p));
+		Ent *t = &v[i];
+		memset(t, 0, sizeof *t);
+		t->flags = r16(p + 8);
+		t->method = r16(p + 10);
+		t->dostime = r16(p + 12);
+		t->dosdate = r16(p + 14);
+		t->crc = r32(p + 16);
+		t->csize = r32(p + 20);
+		t->usize = r32(p + 24);
+		unsigned nl = r16(p + 28), el = r16(p + 30), cl = r16(p + 32);
+		if (r16(p + 34))
+			bad("member %llu lives on disk %u: multi-disk archives "
+			    "are not supported",
+			    (unsigned long long)i, r16(p + 34));
+		t->extattr = r32(p + 38);
+		t->localoff = r32(p + 42);
+
+		if ((uint64_t)nl + el + cl > end - (p + 46))
+			bad("central directory entry %llu: name, extra and "
+			    "comment (%u+%u+%u) run past the end of the "
+			    "directory", (unsigned long long)i, nl, el, cl);
+		if (!nl)
+			bad("central directory entry %llu has an empty name",
+			    (unsigned long long)i);
+		if (!name_ok(abuf + p + 46, nl))
+			bad("central directory entry %llu has a NUL in its "
+			    "name", (unsigned long long)i);
+		t->name = xmalloc(nl + 1);
+		memcpy(t->name, abuf + p + 46, nl);
+		t->name[nl] = '\0';
+		t->isdir = t->name[nl - 1] == '/';
+
+		read_extra(t, p + 46 + nl, el, t->usize == 0xFFFFFFFFu,
+			   t->csize == 0xFFFFFFFFu,
+			   t->localoff == 0xFFFFFFFFu);
+		p += 46 + nl + el + cl;
+	}
+	return v;
+}
+
+/* MS-DOS date and time, as used by every ZIP since 1989.  Two-second
+ * granularity, no time zone -- the fields are local time, which is why unzip
+ * and zipc have to agree on localtime() and not on gmtime(). */
+static void dos_fmt(unsigned date, unsigned time_, char out[20])
+{
+	snprintf(out, 20, "%04u-%02u-%02u %02u:%02u:%02u",
+		 1980 + ((date >> 9) & 0x7f), (date >> 5) & 0x0f, date & 0x1f,
+		 (time_ >> 11) & 0x1f, (time_ >> 5) & 0x3f, (time_ & 0x1f) * 2);
+}
+
+static const char *method_name(unsigned m)
+{
+	switch (m) {
+	case 0:
+		return "stor";
+	case 8:
+		return "defl";
+	default:
+		return "????";
+	}
+}
+
+static void list(const End *e, const Ent *v, int verbose)
+{
+	if (verbose >= 2) {
+		/* Machine-readable, to be diffed against t/oracle.py's `info`
+		 * and against zipinfo -v.  A human format that nobody compares
+		 * against an oracle is decoration. */
+		for (uint64_t i = 0; i < e->nent; i++)
+			printf("%s\t%u\t%u\t%llu\t%llu\t%llu\n", v[i].name,
+			       v[i].method, v[i].crc,
+			       (unsigned long long)v[i].csize,
+			       (unsigned long long)v[i].usize,
+			       (unsigned long long)v[i].localoff);
+		return;
+	}
+	if (!verbose) {
+		for (uint64_t i = 0; i < e->nent; i++)
+			printf("%s\n", v[i].name);
+		return;
+	}
+
+	printf("end-of-central-directory at 0x%llx: %llu entries, directory at "
+	       "0x%llx + %llu bytes, comment %u bytes%s\n",
+	       (unsigned long long)e->eocd, (unsigned long long)e->nent,
+	       (unsigned long long)e->cdoff, (unsigned long long)e->cdsize,
+	       e->commentlen, e->zip64 ? ", Zip64" : "");
+	printf("meth      csize      usize  ratio  crc32     "
+	       "date       time      offset  name\n");
+	uint64_t tc = 0, tu = 0;
+	for (uint64_t i = 0; i < e->nent; i++) {
+		char when[20];
+		dos_fmt(v[i].dosdate, v[i].dostime, when);
+		long ratio = v[i].usize ?
+		    100 - (long)((v[i].csize * 100) / v[i].usize) : 0;
+		printf("%s %10llu %10llu %5ld%%  %08x  %s  0x%-8llx %s%s\n",
+		       method_name(v[i].method),
+		       (unsigned long long)v[i].csize,
+		       (unsigned long long)v[i].usize, ratio, v[i].crc, when,
+		       (unsigned long long)v[i].localoff, v[i].name,
+		       v[i].zip64 ? "  [zip64]" : "");
+		tc += v[i].csize;
+		tu += v[i].usize;
+	}
+	printf("%llu members, %llu bytes compressed, %llu uncompressed\n",
+	       (unsigned long long)e->nent, (unsigned long long)tc,
+	       (unsigned long long)tu);
+}
+
 /* ================================== main ================================ */
 
 static const char USAGE[] =
@@ -421,13 +612,8 @@ int main(int argc, char **argv)
 	slurp(arcname);
 	End e;
 	find_end(&e);
-	if (verbose)
-		printf("end-of-central-directory at 0x%llx: %llu entries, "
-		       "directory at 0x%llx + %llu bytes, comment %u bytes%s\n",
-		       (unsigned long long)e.eocd, (unsigned long long)e.nent,
-		       (unsigned long long)e.cdoff, (unsigned long long)e.cdsize,
-		       e.commentlen, e.zip64 ? ", Zip64" : "");
-	else
-		printf("%llu\n", (unsigned long long)e.nent);
+	Ent *v = read_cd(&e);
+	if (mode == 't')
+		list(&e, v, verbose);
 	return failures ? 1 : 0;
 }
