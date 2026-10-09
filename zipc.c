@@ -209,6 +209,148 @@ static uint64_t r64(uint64_t o)
 #define SIG_Z64LOC 0x07064b50u
 #define SIG_DD     0x08074b50u
 
+/* =========================== reading the archive ======================== */
+
+/* The whole archive is read into memory.  That is a design decision, not an
+ * oversight: ZIP puts its index at the end, so a reader either seeks or
+ * buffers, and buffering means every offset check in this file is a
+ * comparison against one length instead of an lseek that might lie.  PLAN.md
+ * lists streaming as a non-goal.
+ *
+ * shortcut: the ceiling is the archive having to fit in RAM.  mmap() with
+ * MAP_PRIVATE would lift it without changing a single bounds check, since
+ * everything below works from (abuf, alen); do that when a user turns up with
+ * a 40 GB zip. */
+static void slurp(const char *name)
+{
+	int fd = 0;
+	if (name && strcmp(name, "-") != 0) {
+		fd = open(name, O_RDONLY);
+		if (fd < 0)
+			bad("%s: %s", name, strerror(errno));
+	}
+	Buf b = { 0 };
+	for (;;) {
+		bneed(&b, 1u << 16);
+		ssize_t k = read(fd, b.p + b.n, 1u << 16);
+		if (k < 0)
+			bad("read: %s", strerror(errno));
+		if (!k)
+			break;
+		b.n += (size_t)k;
+	}
+	if (fd)
+		close(fd);
+	abuf = b.p;
+	alen = b.n;
+}
+
+/* Where the central directory is, and how many entries it holds. */
+typedef struct {
+	uint64_t cdoff, cdsize, nent;
+	uint64_t eocd;		/* offset of the 22-byte EOCD record */
+	unsigned commentlen;
+	int zip64;		/* a Zip64 EOCD record was used */
+} End;
+
+/* Does a candidate EOCD at `o` point at something that looks like a central
+ * directory?  Used to disambiguate a real EOCD from the signature appearing
+ * by chance -- or on purpose -- inside the archive comment. */
+static int cd_plausible(uint64_t o)
+{
+	uint64_t nent = r16(o + 10), size = r32(o + 12), off = r32(o + 16);
+
+	/* Zip64 spells these as 0xFFFF/0xFFFFFFFF and puts the truth in its own
+	 * record, so a saturated field is not evidence either way. */
+	if (nent == 0xFFFFu || size == 0xFFFFFFFFu || off == 0xFFFFFFFFu)
+		return 1;
+	if (!have(off, size) || off + size > o)
+		return 0;
+	if (!nent)
+		return size == 0;
+	return size >= 46 && r32(off) == SIG_CENT;
+}
+
+/* APPNOTE 4.3.16: the EOCD is the last thing in the file apart from a comment
+ * of up to 65535 bytes, so it is found by scanning backwards for its
+ * signature.  Those four bytes can also appear inside the comment itself,
+ * which sits *after* the record -- so a naive backwards scan finds the decoy
+ * first.  Two filters make that unambiguous in practice: the comment length
+ * field has to account for exactly the bytes that follow the record, and the
+ * offset it gives has to land on a central directory header.
+ *
+ * shortcut: "in practice".  An attacker who controls the whole comment can
+ * build a decoy that satisfies both and embeds a second, complete central
+ * directory, and then the file genuinely has two readings and every extractor
+ * picks one.  We pick the last one in the file, which is Info-ZIP's choice;
+ * the test suite pins that agreement rather than claiming the ambiguity away. */
+static void find_end(End *e)
+{
+	if (alen < 22)
+		bad("too short to be a zip archive (%zu bytes)", alen);
+
+	uint64_t lo = alen > 65557 ? alen - 65557 : 0;
+	uint64_t found = UINT64_MAX, loose = UINT64_MAX;
+
+	for (uint64_t o = alen - 22 + 1; o-- > lo;) {
+		if (r32(o) != SIG_EOCD)
+			continue;
+		if ((uint64_t)r16(o + 20) != alen - o - 22)
+			continue;	/* comment length does not reach the end */
+		if (loose == UINT64_MAX)
+			loose = o;
+		if (cd_plausible(o)) {
+			found = o;
+			break;
+		}
+	}
+	if (found == UINT64_MAX)
+		found = loose;
+	if (found == UINT64_MAX)
+		bad("no end-of-central-directory record found");
+
+	memset(e, 0, sizeof *e);
+	e->eocd = found;
+	e->commentlen = r16(found + 20);
+	if (r16(found + 4) || r16(found + 6))
+		bad("multi-disk archives are not supported (disk %u of %u)",
+		    r16(found + 4), r16(found + 6));
+	e->nent = r16(found + 10);
+	e->cdsize = r32(found + 12);
+	e->cdoff = r32(found + 16);
+
+	/* Zip64: a 20-byte locator sits immediately before the EOCD and points
+	 * back at the Zip64 EOCD record, whose fields are the real ones. */
+	if (found >= 20 && r32(found - 20) == SIG_Z64LOC) {
+		if (r32(found - 20 + 4))
+			bad("multi-disk Zip64 archive is not supported");
+		uint64_t z = r64(found - 20 + 8);
+		if (!have(z, 56) || r32(z) != SIG_Z64EOC)
+			bad("Zip64 locator points at 0x%llx, which is not a "
+			    "Zip64 end-of-central-directory record",
+			    (unsigned long long)z);
+		e->zip64 = 1;
+		e->nent = r64(z + 32);
+		e->cdsize = r64(z + 40);
+		e->cdoff = r64(z + 48);
+	}
+
+	if (!have(e->cdoff, e->cdsize))
+		bad("central directory at 0x%llx + %llu bytes runs past the "
+		    "end of a %zu-byte archive",
+		    (unsigned long long)e->cdoff,
+		    (unsigned long long)e->cdsize, alen);
+	if (e->cdoff + e->cdsize > e->eocd)
+		bad("central directory overlaps the end-of-central-directory record");
+	/* 46 bytes is the shortest a central directory header can be, so an
+	 * entry count the directory cannot possibly hold is a lie and the
+	 * allocation it implies must not happen. */
+	if (e->nent > e->cdsize / 46)
+		bad("%llu central directory entries declared but only %llu "
+		    "bytes of directory",
+		    (unsigned long long)e->nent, (unsigned long long)e->cdsize);
+}
+
 /* ================================== main ================================ */
 
 static const char USAGE[] =
@@ -262,27 +404,30 @@ int main(int argc, char **argv)
 		}
 	}
 
-	(void)verbose;
-	(void)arcname;
-	(void)abuf;
-	(void)have;
-	(void)r16;
-	(void)r32;
-	(void)r64;
 	(void)crc32b;
 	(void)bu16;
 	(void)bu32;
 	(void)bu64;
 	(void)bwrite;
-	(void)bput;
 	(void)xmalloc;
 	(void)warn_;
 	(void)refuse;
-	(void)bad;
 
 	if (!mode) {
 		fputs(USAGE, stderr);
 		return 2;
 	}
+
+	slurp(arcname);
+	End e;
+	find_end(&e);
+	if (verbose)
+		printf("end-of-central-directory at 0x%llx: %llu entries, "
+		       "directory at 0x%llx + %llu bytes, comment %u bytes%s\n",
+		       (unsigned long long)e.eocd, (unsigned long long)e.nent,
+		       (unsigned long long)e.cdoff, (unsigned long long)e.cdsize,
+		       e.commentlen, e.zip64 ? ", Zip64" : "");
+	else
+		printf("%llu\n", (unsigned long long)e.nent);
 	return failures ? 1 : 0;
 }
