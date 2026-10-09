@@ -384,6 +384,25 @@ def cmd_corrupt_cd_sig(src, dst):
     out('OK')
 
 
+def cmd_corrupt_local_off(src, dst):
+    """Point the first central entry's local-header offset past the end."""
+    b = bytearray(open(src, 'rb').read())
+    i = b.find(b'PK\x01\x02')
+    struct.pack_into('<I', b, i + 42, 0xfffffff0)
+    open(dst, 'wb').write(bytes(b))
+    out('OK')
+
+
+def cmd_corrupt_local_sig(src, dst):
+    b = bytearray(open(src, 'rb').read())
+    with zipfile.ZipFile(src) as z:
+        off = z.infolist()[0].header_offset
+    assert b[off:off + 4] == b'PK\x03\x04'
+    b[off + 1] = 0x5a
+    open(dst, 'wb').write(bytes(b))
+    out('OK')
+
+
 def craft_crc_bad(path):
     _raw(path, [('good.txt', b'hello world\n', 8)])
     _patch_sizes(path, 'good.txt', crc=0xdeadbeef)

@@ -143,6 +143,43 @@ python3 "$ORACLE" corrupt-cd-sig "$TMP/cd9.zip" "$TMP/cdsig.zip" >/dev/null
 eq "central dir: a wrong entry signature exits 2" "$?" 2
 
 # --------------------------------------------------------------------- #
+# 3. local file headers, checked against the central directory          #
+# --------------------------------------------------------------------- #
+# -T locates each member's data through its local header and checks that the
+# header agrees with the directory.  It does not yet decompress anything.
+for how in 0 9 X; do
+	assert "zip -$how: every local header agrees" "$ZIPC" -Tf "$TMP/cd$how.zip"
+done
+
+# The disagreement cases.  Info-ZIP detects the size one too (it warns and
+# exits 1), which is the agreement worth having: zipc is not inventing a
+# stricter rule than the format's own tool applies.
+python3 "$ORACLE" craft local-disagrees "$TMP/ld.zip" >/dev/null
+"$ZIPC" -Tf "$TMP/ld.zip" >/dev/null 2>"$TMP/ld.err"
+eq "local header: a size disagreement exits 1" "$?" 1
+assert "local header: ... and says which numbers disagree" \
+	grep -q 'local header says crc .* central directory says' "$TMP/ld.err"
+assert "local header: ... and says it used the central directory" \
+	grep -q 'using the central directory' "$TMP/ld.err"
+refute "local header: unzip -t also rejects the size disagreement" \
+	unzip -t "$TMP/ld.zip"
+
+python3 "$ORACLE" craft local-name-differs "$TMP/ln.zip" >/dev/null
+"$ZIPC" -Tf "$TMP/ln.zip" >/dev/null 2>"$TMP/ln.err"
+eq "local header: a name disagreement exits 1" "$?" 1
+assert "local header: ... and is reported as a refusal" \
+	grep -q 'REFUSING.*names a different member' "$TMP/ln.err"
+
+# A local header offset pointing outside the archive, and one pointing at
+# the wrong signature: structural, so exit 2 rather than a skipped member.
+python3 "$ORACLE" corrupt-local-off "$TMP/cd9.zip" "$TMP/loff.zip" >/dev/null
+"$ZIPC" -Tf "$TMP/loff.zip" >/dev/null 2>&1
+eq "local header: an offset outside the archive exits 2" "$?" 2
+python3 "$ORACLE" corrupt-local-sig "$TMP/cd9.zip" "$TMP/lsig.zip" >/dev/null
+"$ZIPC" -Tf "$TMP/lsig.zip" >/dev/null 2>&1
+eq "local header: a wrong signature exits 2" "$?" 2
+
+# --------------------------------------------------------------------- #
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

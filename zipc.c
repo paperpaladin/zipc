@@ -542,6 +542,88 @@ static void list(const End *e, const Ent *v, int verbose)
 	       (unsigned long long)tu);
 }
 
+/* =========================== local file headers ========================= */
+
+/* Finds a member's compressed data and checks the local file header against
+ * the central directory.
+ *
+ * The check is the whole point of reading the local header at all.  Nothing
+ * in it is believed: the sizes, CRC and method used to extract all come from
+ * the central directory.  An extractor that believes the local header can be
+ * handed an archive whose listing shows one thing and whose extraction
+ * produces another, which is how a scanner and a user end up disagreeing
+ * about what is inside a file.
+ *
+ * Returns the offset of the compressed data, or UINT64_MAX if the member must
+ * be skipped (failures has been incremented and a line printed).  A structural
+ * impossibility -- a header outside the archive, a bad signature -- is exit 2
+ * instead, because it means the file is not a readable archive rather than
+ * that one member is bad.
+ */
+static uint64_t member_data(const Ent *t)
+{
+	if (!have(t->localoff, 30))
+		bad("%s: local header at 0x%llx is outside the archive",
+		    t->name, (unsigned long long)t->localoff);
+	if (r32(t->localoff) != SIG_LOCAL)
+		bad("%s: local header at 0x%llx has signature 0x%08x, expected "
+		    "0x04034b50", t->name, (unsigned long long)t->localoff,
+		    r32(t->localoff));
+
+	unsigned lflags = r16(t->localoff + 6), lmethod = r16(t->localoff + 8);
+	uint32_t lcrc = r32(t->localoff + 14);
+	unsigned nl = r16(t->localoff + 26), el = r16(t->localoff + 28);
+	if (!have(t->localoff + 30, (uint64_t)nl + el))
+		bad("%s: local header name and extra field run past the end of "
+		    "the archive", t->name);
+
+	/* The name is stored twice.  They have to be the same name, or the
+	 * listing and the extraction are describing different members. */
+	if (nl != strlen(t->name) ||
+	    memcmp(abuf + t->localoff + 30, t->name, nl) != 0) {
+		refuse(t->name, "local header names a different member");
+		return UINT64_MAX;
+	}
+
+	Ent loc = { 0 };
+	loc.csize = r32(t->localoff + 18);
+	loc.usize = r32(t->localoff + 22);
+	read_extra(&loc, t->localoff + 30 + nl, el,
+		   loc.usize == 0xFFFFFFFFu, loc.csize == 0xFFFFFFFFu, 0);
+
+	if (lmethod != t->method) {
+		refuse(t->name, "local header and central directory disagree "
+		       "about the compression method");
+		return UINT64_MAX;
+	}
+	if ((lflags & F_DATADESC) != (t->flags & F_DATADESC)) {
+		refuse(t->name, "local header and central directory disagree "
+		       "about the data-descriptor flag");
+		return UINT64_MAX;
+	}
+	/* With bit 3 set the local sizes and CRC are legitimately zero: the
+	 * real values follow the data.  Without it, they must agree. */
+	if (!(t->flags & F_DATADESC) &&
+	    (loc.csize != t->csize || loc.usize != t->usize || lcrc != t->crc)) {
+		fprintf(stderr, "%s: %s: local header says crc %08x csize %llu "
+			"usize %llu, central directory says crc %08x csize %llu "
+			"usize %llu -- using the central directory\n",
+			prog, t->name, lcrc, (unsigned long long)loc.csize,
+			(unsigned long long)loc.usize, t->crc,
+			(unsigned long long)t->csize,
+			(unsigned long long)t->usize);
+		failures++;
+		return UINT64_MAX;
+	}
+
+	uint64_t off = t->localoff + 30 + nl + el;
+	if (!have(off, t->csize))
+		bad("%s: %llu compressed bytes at 0x%llx run past the end of a "
+		    "%zu-byte archive", t->name, (unsigned long long)t->csize,
+		    (unsigned long long)off, alen);
+	return off;
+}
+
 /* ================================== main ================================ */
 
 static const char USAGE[] =
@@ -613,7 +695,23 @@ int main(int argc, char **argv)
 	End e;
 	find_end(&e);
 	Ent *v = read_cd(&e);
-	if (mode == 't')
+	if (mode == 't') {
 		list(&e, v, verbose);
+	} else if (mode == 'T') {
+		for (uint64_t k = 0; k < e.nent; k++) {
+			uint64_t off = member_data(&v[k]);
+			if (off == UINT64_MAX)
+				continue;
+			if (verbose)
+				printf("%s: %llu bytes of method-%u data at "
+				       "0x%llx\n", v[k].name,
+				       (unsigned long long)v[k].csize,
+				       v[k].method, (unsigned long long)off);
+		}
+		if (!failures && verbose)
+			printf("%llu members, every local header agrees with "
+			       "the central directory\n",
+			       (unsigned long long)e.nent);
+	}
 	return failures ? 1 : 0;
 }
