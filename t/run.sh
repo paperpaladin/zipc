@@ -189,7 +189,11 @@ eq "local header: a wrong signature exits 2" "$?" 2
 crc_agree() {
 	local tag=$1 z=$2
 	"$ZIPC" -Tvf "$z" | LC_ALL=C sort >"$TMP/crc.zc"
-	zi_info "$z" | awk -F'\t' '$5 != 0 || $4 != 0 {
+	# Directories, and only directories, are dropped: zipc does not
+	# decompress them.  Filtering on "size is zero" instead would also
+	# drop the empty-file member, which is exactly the case most likely
+	# to be wrong.
+	zi_info "$z" | awk -F'\t' '$1 !~ /\/$/ {
 		printf "%s\t%08x\t%d\n", $1, $3, $5 }' | LC_ALL=C sort >"$TMP/crc.zi"
 	assert "$tag: computed CRC and size == zipinfo's declared" \
 		diff -u "$TMP/crc.zi" "$TMP/crc.zc"
@@ -225,6 +229,42 @@ python3 "$ORACLE" craft method99 "$TMP/m99.zip" >/dev/null
 eq "unknown compression method exits 1" "$?" 1
 assert "unknown compression method says so" \
 	grep -q 'unsupported compression method' "$TMP/m99.err"
+
+# --------------------------------------------------------------------- #
+# 5. DEFLATE, decoder vendored from ../inflate                          #
+# --------------------------------------------------------------------- #
+# The tree for this section has one member of each awkward kind: a file that
+# compresses badly (urandom, so DEFLATE falls back to stored blocks), one
+# that compresses extremely well, an empty file, and a nested path.
+mkdir -p "$TMP/d/sub"
+head -c 200000 /dev/urandom >"$TMP/d/random.bin"
+python3 -c "import sys; open(sys.argv[1],'w').write('hello world, text\n'*9000)" \
+	"$TMP/d/squishy.txt"
+: >"$TMP/d/empty"
+printf 'nested\n' >"$TMP/d/sub/deep.txt"
+printf 'bin\000\001\377\000data' >"$TMP/d/binary.dat"
+
+for how in 1 6 9; do
+	(cd "$TMP" && rm -f "d$how.zip" && zip -q "-$how" -r "d$how.zip" d)
+	crc_agree "zip -$how deflate" "$TMP/d$how.zip"
+done
+
+# Every level of zip, and zipfile's deflate too, must inflate to the right
+# CRC.  The CRC comes out of the archive, so this is checked against a
+# number Info-ZIP and zlib computed, not one zipc chose.
+python3 "$ORACLE" write "$TMP/pyd.zip" "$TMP/d" deflate >/dev/null
+crc_agree "zipfile deflate" "$TMP/pyd.zip"
+python3 "$ORACLE" write "$TMP/pys.zip" "$TMP/d" store >/dev/null
+crc_agree "zipfile store" "$TMP/pys.zip"
+
+# A DEFLATE stream cut short.  Deterministic, unlike a byte flip -- the
+# stream genuinely ends mid-block, so the decoder has to say so rather than
+# read past the member into the next one or into the central directory.
+python3 "$ORACLE" cut-deflate "$TMP/d9.zip" "$TMP/dcut.zip" >/dev/null
+"$ZIPC" -Tf "$TMP/dcut.zip" >/dev/null 2>"$TMP/dcut.err"
+eq "DEFLATE: a stream cut short exits 1, not 0" "$?" 1
+assert "DEFLATE: ... and says it was truncated" grep -q truncated "$TMP/dcut.err"
+refute "DEFLATE: unzip -t rejects it too" unzip -t "$TMP/dcut.zip"
 
 # --------------------------------------------------------------------- #
 echo

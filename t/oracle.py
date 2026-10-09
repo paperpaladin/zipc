@@ -411,6 +411,32 @@ def craft_store_size_mismatch(path):
     _patch_sizes(path, 's.txt', usize=999)
 
 
+def _biggest_deflated(src):
+    with zipfile.ZipFile(src) as z:
+        return max((i for i in z.infolist() if i.compress_type == 8),
+                   key=lambda i: i.compress_size)
+
+
+def cmd_flip_deflate(src, dst):
+    """Flip one byte in the middle of the largest deflated member's data."""
+    b = bytearray(open(src, 'rb').read())
+    zi = _biggest_deflated(src)
+    nl, el = struct.unpack_from('<HH', b, zi.header_offset + 26)
+    b[zi.header_offset + 30 + nl + el + zi.compress_size // 2] ^= 0xff
+    open(dst, 'wb').write(bytes(b))
+    out('OK')
+
+
+def cmd_cut_deflate(src, dst):
+    """Halve the declared compressed size of the largest deflated member, in
+    both headers, so its stream genuinely ends mid-block."""
+    import shutil
+    shutil.copyfile(src, dst)
+    zi = _biggest_deflated(dst)
+    _patch_sizes(dst, zi.filename, csize=zi.compress_size // 2)
+    out('OK')
+
+
 def craft_crc_bad(path):
     _raw(path, [('good.txt', b'hello world\n', 8)])
     _patch_sizes(path, 'good.txt', crc=0xdeadbeef)
