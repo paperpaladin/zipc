@@ -1,0 +1,5 @@
+zipc
+zipc-asan
+.scratch/
+t/tmp*
+*.o
