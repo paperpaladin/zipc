@@ -180,6 +180,53 @@ python3 "$ORACLE" corrupt-local-sig "$TMP/cd9.zip" "$TMP/lsig.zip" >/dev/null
 eq "local header: a wrong signature exits 2" "$?" 2
 
 # --------------------------------------------------------------------- #
+# 4. STORE: the bytes come out, and the CRC we compute is the CRC in    #
+#    the directory -- which Info-ZIP wrote and we did not               #
+# --------------------------------------------------------------------- #
+# -Tv prints name, the CRC-32 zipc computed over the decompressed bytes, and
+# the length.  Compared against zipinfo -v's declared CRC and size, so the
+# number zipc computes is checked against a number Info-ZIP put there.
+crc_agree() {
+	local tag=$1 z=$2
+	"$ZIPC" -Tvf "$z" | LC_ALL=C sort >"$TMP/crc.zc"
+	zi_info "$z" | awk -F'\t' '$5 != 0 || $4 != 0 {
+		printf "%s\t%08x\t%d\n", $1, $3, $5 }' | LC_ALL=C sort >"$TMP/crc.zi"
+	assert "$tag: computed CRC and size == zipinfo's declared" \
+		diff -u "$TMP/crc.zi" "$TMP/crc.zc"
+}
+crc_agree "zip -0" "$TMP/cd0.zip"
+
+# Bytes, not just checksums: a stored member's data must be exactly the file.
+# (The full tree round-trip is section 8; this is the one-member version, so
+# that STORE is proven byte-exact before DEFLATE is added on top of it.)
+(cd "$TMP" && rm -f one.zip && zip -q -0 one.zip s/a.txt)
+mkdir -p "$TMP/onex"
+assert "STORE: unzip extracts the one stored member" \
+	unzip -q -o -d "$TMP/onex" "$TMP/one.zip"
+assert "STORE: ... byte-identical" cmp "$TMP/s/a.txt" "$TMP/onex/s/a.txt"
+
+# A stored member whose two sizes differ is refused rather than copied.
+python3 "$ORACLE" craft store-size-mismatch "$TMP/ssm.zip" >/dev/null
+"$ZIPC" -Tf "$TMP/ssm.zip" >/dev/null 2>"$TMP/ssm.err"
+eq "STORE: differing compressed/uncompressed sizes exit 1" "$?" 1
+assert "STORE: ... and say so" \
+	grep -q 'different compressed and uncompressed sizes' "$TMP/ssm.err"
+
+# An encrypted member is refused, not silently extracted as garbage.
+python3 "$ORACLE" craft encrypted "$TMP/enc.zip" >/dev/null
+"$ZIPC" -Tf "$TMP/enc.zip" >/dev/null 2>"$TMP/enc.err"
+eq "encrypted member exits 1" "$?" 1
+assert "encrypted member says it is unsupported" \
+	grep -q 'encrypted' "$TMP/enc.err"
+
+# A method we do not implement is refused by name, not guessed at.
+python3 "$ORACLE" craft method99 "$TMP/m99.zip" >/dev/null
+"$ZIPC" -Tf "$TMP/m99.zip" >/dev/null 2>"$TMP/m99.err"
+eq "unknown compression method exits 1" "$?" 1
+assert "unknown compression method says so" \
+	grep -q 'unsupported compression method' "$TMP/m99.err"
+
+# --------------------------------------------------------------------- #
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

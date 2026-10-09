@@ -403,6 +403,14 @@ def cmd_corrupt_local_sig(src, dst):
     out('OK')
 
 
+def craft_store_size_mismatch(path):
+    """A stored member claiming different compressed and uncompressed sizes.
+    For method 0 those are one number written twice, so this cannot be
+    anything but corruption or an attack."""
+    _raw(path, [('s.txt', b'hello world\n', 0)])
+    _patch_sizes(path, 's.txt', usize=999)
+
+
 def craft_crc_bad(path):
     _raw(path, [('good.txt', b'hello world\n', 8)])
     _patch_sizes(path, 'good.txt', crc=0xdeadbeef)

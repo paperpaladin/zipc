@@ -624,6 +624,39 @@ static uint64_t member_data(const Ent *t)
 	return off;
 }
 
+/* ============================= decompression ============================ */
+
+/* Produces a member's uncompressed bytes in *o.  Returns NULL on success,
+ * else why not; the caller decides whether that is fatal.
+ *
+ * `o->limit` is set from the central directory's declared size before a
+ * single byte is produced, so a stream that decompresses to more than its own
+ * header claims stops immediately instead of filling memory.  A STORE member
+ * cannot lie that way -- its two sizes have to be equal, which is checked --
+ * so the limit matters only for DEFLATE. */
+static const char *member_bytes(const Ent *t, uint64_t data, Buf *o)
+{
+	o->n = 0;
+	o->limit = (size_t)t->usize;
+
+	if (t->flags & F_ENCRYPTED)
+		return "encrypted members are not supported";
+
+	switch (t->method) {
+	case 0:
+		/* STORE: the two sizes are the same number written twice, and
+		 * an archive where they differ is telling us something is
+		 * wrong before we have copied anything. */
+		if (t->csize != t->usize)
+			return "stored member has different compressed and "
+			    "uncompressed sizes";
+		bwrite(o, abuf + data, (size_t)t->csize);
+		return NULL;
+	default:
+		return "unsupported compression method";
+	}
+}
+
 /* ================================== main ================================ */
 
 static const char USAGE[] =
@@ -698,20 +731,27 @@ int main(int argc, char **argv)
 	if (mode == 't') {
 		list(&e, v, verbose);
 	} else if (mode == 'T') {
+		Buf o = { 0 };
 		for (uint64_t k = 0; k < e.nent; k++) {
 			uint64_t off = member_data(&v[k]);
 			if (off == UINT64_MAX)
 				continue;
+			if (v[k].isdir)
+				continue;
+			const char *why = member_bytes(&v[k], off, &o);
+			if (why) {
+				warn_("%s: %s", v[k].name, why);
+				failures++;
+				continue;
+			}
+			/* Printed, not yet compared: the comparison is the
+			 * next commit, and a number nobody has checked
+			 * against zipinfo is not evidence of anything. */
 			if (verbose)
-				printf("%s: %llu bytes of method-%u data at "
-				       "0x%llx\n", v[k].name,
-				       (unsigned long long)v[k].csize,
-				       v[k].method, (unsigned long long)off);
+				printf("%s\t%08x\t%zu\n", v[k].name,
+				       crc32b(o.p, o.n), o.n);
 		}
-		if (!failures && verbose)
-			printf("%llu members, every local header agrees with "
-			       "the central directory\n",
-			       (unsigned long long)e.nent);
+		free(o.p);
 	}
 	return failures ? 1 : 0;
 }
