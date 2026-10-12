@@ -948,19 +948,22 @@ static const char *member_bytes(const Ent *t, uint64_t data, Buf *o)
 
 /* ================================== main ================================ */
 
+/* The usage text lists what is built, and lists the rest under "not yet".
+ * It used to advertise the finished interface -- -c, -x, -C, -0, -D and -Z --
+ * of which the option parser handles none, so six documented flags either
+ * printed this very text back at the caller or, for -c and -x, were accepted
+ * and did nothing. A usage message is a promise about the binary it ships
+ * with, not about the plan. */
 static const char USAGE[] =
-    "usage: zipc -c|-t|-T|-x [-v] [-0] [-D] [-Z] [-f ARCHIVE] [-C DIR] [PATH...]\n"
-    "  -c  create an archive of PATH... (directories recursed, sorted)\n"
+    "usage: zipc -t|-T [-v] [-f ARCHIVE]\n"
     "  -t  list the central directory; -tv long-form\n"
     "  -T  test: decompress every member and check its CRC-32, write nothing\n"
-    "  -x  extract\n"
-    "  -f  archive file; '-' or omitted means stdout (-c) or stdin (-t/-T/-x)\n"
-    "  -C  extract into DIR\n"
-    "  -0  store, do not deflate\n"
-    "  -D  write data descriptors instead of sizes in the local header\n"
-    "  -Z  force Zip64 on every member and on the EOCD\n"
+    "  -f  archive file; '-' or omitted means stdin\n"
+    "not implemented yet, and refused rather than ignored:\n"
+    "  -c  create an archive        -x  extract        -C DIR  extract into DIR\n"
+    "  -0  store, do not deflate    -D  data descriptors   -Z  force Zip64\n"
     "exit 0 on success, 1 if a member was refused or skipped, 2 if the\n"
-    "archive is not parseable.\n";
+    "archive is not parseable, 3 if the mode asked for is not implemented.\n";
 
 int main(int argc, char **argv)
 {
@@ -1012,6 +1015,23 @@ int main(int argc, char **argv)
 	if (!mode) {
 		fputs(USAGE, stderr);
 		return 2;
+	}
+
+	/* -c and -x parse but are not written yet, and everything below this
+	 * point reads an archive. So -c used to slurp the archive it had been
+	 * asked to create ("zipc: too short to be a zip archive (0 bytes)",
+	 * or "No such file or directory" with -f), and -x used to read the
+	 * archive, build the central directory, match neither branch below,
+	 * and return 0 -- extracting nothing and reporting success, which a
+	 * caller in a script cannot tell from having extracted everything.
+	 * Exit 3 says "not implemented" in a way that is not a diagnostic
+	 * about the input, the same separation xmlc needed. */
+	if (mode == 'c' || mode == 'x') {
+		fprintf(stderr, "zipc: -%c is not implemented yet"
+		        " (PLAN item %s)\n", mode,
+		        mode == 'c' ? "11, -c writing stored members"
+		                    : "05, stored extraction");
+		return 3;
 	}
 
 	slurp(arcname);

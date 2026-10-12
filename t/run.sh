@@ -267,6 +267,38 @@ assert "DEFLATE: ... and says it was truncated" grep -q truncated "$TMP/dcut.err
 refute "DEFLATE: unzip -t rejects it too" unzip -t "$TMP/dcut.zip"
 
 # --------------------------------------------------------------------- #
+# The modes that are not written yet have to refuse, not pretend.
+#
+# -x used to be accepted, read the archive, match no branch, and return 0 --
+# extracting nothing while reporting success. A caller in a shell script
+# cannot tell that from a complete extraction, and this suite did not look.
+# -c used to slurp the archive it had been asked to create and fail with a
+# diagnostic about the *input* being unreadable.
+#
+# Each unimplemented mode is checked for its own exit status (3, distinct from
+# 1 "refused a member" and 2 "unparseable") and for naming itself, so neither
+# can quietly become an exit 0 again.
+for m in c x; do
+	"$ZIPC" "-$m" -f "$TMP/d9.zip" a >/dev/null 2>"$TMP/ni.err"
+	eq "-$m is not implemented and exits 3, not 0" "$?" 3
+	assert "-$m says which flag is missing" grep -q -- "-$m is not implemented" "$TMP/ni.err"
+done
+
+# A flag the parser does not handle must be refused, and the usage text must
+# not be advertising it. -C, -0, -D and -Z were all listed as if they worked.
+for m in C 0 D Z; do
+	"$ZIPC" "-$m" -tf "$TMP/d9.zip" >/dev/null 2>"$TMP/uf.err"
+	eq "-$m is refused rather than ignored" "$?" 2
+	refute "usage does not offer -$m as working" \
+		sh -c "sed -n '1p' '$TMP/uf.err' | grep -q -- '-$m'"
+done
+
+# -t and -T are the two that do work, and must keep working.
+"$ZIPC" -tf "$TMP/d9.zip" >/dev/null 2>&1
+eq "-t still exits 0" "$?" 0
+"$ZIPC" -Tf "$TMP/d9.zip" >/dev/null 2>&1
+eq "-T still exits 0" "$?" 0
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

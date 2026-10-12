@@ -41,6 +41,23 @@ In scope, on both sides:
 Exit status: 0 success, 1 something was skipped or refused, 2 the archive is
 not parseable.
 
+## Status, as of the last commit
+
+The read side works and the write side does not exist. `-t` lists the central
+directory and `-T` decompresses every member and checks its CRC-32, both
+compared against `unzip`, `zipinfo -v` and Python's `zipfile` over archives
+written by `zip` at every compression level. `-c`, `-x`, `-C`, `-0`, `-D` and
+`-Z` are not implemented, and the binary now refuses them -- exit 3 for the
+two modes, exit 2 for the four flags -- rather than accepting them silently.
+`-x` in particular used to read the archive and return 0 having extracted
+nothing.
+
+The sections below describe the finished tool, which is what a plan is for.
+Of the oracles, the `unzip`/`zipinfo` and `zipfile` read comparisons are
+wired up; nothing writes an archive yet, so neither direction of the
+write-side differential exists, and the malicious-archive and truncation
+sweeps are item 17.
+
 ## Hard invariant
 
 **1. The central directory is authoritative.** Every size, CRC and method
