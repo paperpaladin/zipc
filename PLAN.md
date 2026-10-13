@@ -5,6 +5,13 @@
 `zipc` is a ZIP archive reader and writer: one C11 file, no libraries, no
 shelling out.
 
+**As of the last commit the write side does not exist.** This section
+describes the finished tool, which is what a plan is for; "Status, as of the
+last commit" below says what the binary actually does, and the binary itself
+refuses the unimplemented modes rather than accepting them silently. The
+pointer is here because this was the first thing a reader saw and it read as
+a feature list.
+
 ```
 zipc -c|-t|-T|-x [-v] [-0] [-D] [-Z] [-f ARCHIVE] [-C DIR] [PATH...]
 ```
