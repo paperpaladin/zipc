@@ -5,10 +5,10 @@
 `zipc` is a ZIP archive reader and writer: one C11 file, no libraries, no
 shelling out.
 
-**As of the last commit the write side does not exist.** This section
+As of the last commit the write side does not exist. This section
 describes the finished tool, which is what a plan is for; "Status, as of the
 last commit" below says what the binary actually does, and the binary itself
-refuses the unimplemented modes rather than accepting them silently. The
+refuses the unimplemented modes instead of accepting them silently. The
 pointer is here because this was the first thing a reader saw and it read as
 a feature list.
 
@@ -27,7 +27,7 @@ zipc -c|-t|-T|-x [-v] [-0] [-D] [-Z] [-f ARCHIVE] [-C DIR] [PATH...]
 * `-C DIR` is the extraction destination.
 * `-0` stores instead of deflating. Without it, members are deflated and each
   one individually falls back to STORE when deflating made it bigger.
-* `-D` writes data descriptors (general-purpose flag bit 3) rather than sizes
+* `-D` writes data descriptors (general-purpose flag bit 3), not sizes
   in the local header. Read support is unconditional.
 * `-Z` forces Zip64 on every member and on the end-of-central-directory, so
   the Zip64 path is reachable without a 4 GB archive.
@@ -54,45 +54,45 @@ The read side works and the write side does not exist. `-t` lists the central
 directory and `-T` decompresses every member and checks its CRC-32, both
 compared against `unzip`, `zipinfo -v` and Python's `zipfile` over archives
 written by `zip` at every compression level. `-c`, `-x`, `-C`, `-0`, `-D` and
-`-Z` are not implemented, and the binary now refuses them -- exit 3 for the
-two modes, exit 2 for the four flags -- rather than accepting them silently.
+`-Z` are not implemented, and the binary now refuses them, exit 3 for the
+two modes, exit 2 for the four flags, instead of accepting them silently.
 `-x` in particular used to read the archive and return 0 having extracted
 nothing.
 
 The sections below describe the finished tool, which is what a plan is for.
 Of the oracles, the `unzip`/`zipinfo` and `zipfile` read comparisons are
-wired up; nothing writes an archive yet, so neither direction of the
+wired up. Nothing writes an archive yet, so neither direction of the
 write-side differential exists, and the malicious-archive and truncation
 sweeps are item 17.
 
 ## Hard invariant
 
-**1. The central directory is authoritative.** Every size, CRC and method
+1. The central directory is authoritative. Every size, CRC and method
 used to extract a member comes from the central directory, never from the
 local file header. The local header is read, and checked against the central
 directory, only so that a disagreement can be *reported*. An extractor that
 believes the local header can be made to write a different file than the one
 its own listing shows.
 
-**2. No member can ever be written outside the destination.** Not by an
+2. No member can ever be written outside the destination. Not by an
 absolute path, not by a `..` component, not by a backslash that a
 Windows-aware extractor would treat as a separator, not by a drive letter,
 not by a symlink member whose target climbs out, and not through a symlink
 sitting in the destination already. The response is refusal with a nonzero
 exit, never silent sanitisation.
 
-**3. A hostile size cannot exhaust memory or disk.** The declared
+3. A hostile size cannot exhaust memory or disk. The declared
 uncompressed size is checked against a per-member and a whole-archive cap
 *before* anything is decompressed, the expansion ratio is capped, and the
 decompressor is additionally handed a hard output limit so that a header
-which lies about its size stops the inflate rather than the machine.
+which lies about its size stops the inflate, not the machine.
 
 ## Oracle
 
 Ranked, strongest first. None of the three is a build dependency; all three
 are only ever invoked by `t/run.sh`.
 
-1. **Info-ZIP `unzip` 6.00, bidirectionally.** `unzip -t` must validate every
+1. Info-ZIP `unzip` 6.00, bidirectionally. `unzip -t` must validate every
    archive `zipc -c` writes, at every combination of `-0`/deflate, `-D` and
    `-Z`, and `unzip` must extract it to a tree `diff -r` says is identical to
    the input. In the other direction `zipc -x` must read what `zip 3.0`
@@ -100,23 +100,23 @@ are only ever invoked by `t/run.sh`.
    the per-member method, CRC, sizes and local-header offset, which are
    diffed against `zipc -tv`'s. `unzip`/`zip` define the format, so a
    disagreement means zipc is wrong.
-2. **Python's `zipfile`, a third independent implementation.** It must read
-   ours -- `testzip()` returning `None` on every archive we write, and
-   `read()` byte-identical -- and we must read what it writes, including the
+2. Python's `zipfile`, a third independent implementation. It must read
+   ours: `testzip()` returning `None` on every archive we write, and
+   `read()` byte-identical, and we must read what it writes, including the
    `force_zip64=True` and non-seekable (data-descriptor) paths that `zip`
    itself will not produce.
-3. **The malicious-archive sweep.** `zipfile` lets a member name be written
+3. The malicious-archive sweep. `zipfile` lets a member name be written
    verbatim, which is how the hostile archives are built: `../escape`,
    `/abs/escape`, `..\..\escape`, `a/../../escape`, `C:\escape`, a name with
    an embedded NUL, and a symlink member whose target is `/etc/passwd`. Each
    asserts a nonzero exit, a `REFUSING` line, that nothing appeared beside
    the destination, and that a canary file outside the destination was
    neither modified nor read (checked by mtime *and* atime).
-4. **The truncation sweep.** A real archive cut at every structural boundary
-   -- and then at every single byte offset of a small one -- fed to `-t`,
+4. The truncation sweep. A real archive cut at every structural boundary,
+   and then at every single byte offset of a small one, fed to `-t`,
    `-T` and `-x`. Every run must exit 2 and no run may die on a signal or
    fail to terminate.
-5. **ASan + UBSan over the whole harness** (`make test-asan`). We parse
+5. ASan + UBSan over the whole harness (`make test-asan`). We parse
    attacker-controlled offsets and lengths out of a byte buffer, which is the
    exact shape of problem that produces archiver CVEs.
 
@@ -129,7 +129,7 @@ are only ever invoked by `t/run.sh`.
   (93), Deflate64 (9), Shrink/Reduce/Implode (1-6).
 * Multi-disk and split archives. A nonzero disk number is an error.
 * Creating symlinks on extract. A symlink member is refused outright, which
-  removes a whole class of escape rather than analysing it.
+  removes a whole class of escape instead of analysing it.
 * Appending to or updating an existing archive, deleting members, member
   selection on extract, `--exclude`, `-j`/junk-paths, `--strip-components`.
 * Streaming. The whole archive is read into memory, because the format puts
