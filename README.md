@@ -27,7 +27,7 @@ Archives written by Info-ZIP's `zip` at every compression level, read back
 three ways:
 
 - `unzip -t`: against `zipc -T`, member by member, CRC by CRC.
-- `zipinfo -v`: against `zipc -tv`, which is why the long form prints
+- `zipinfo -v`: against `zipc -tv`, and that is why the long form prints
   method, sizes, ratio, CRC-32, DOS date/time and local-header offset in a
   diffable layout.
 - Python's `zipfile`: a second independent implementation, in case

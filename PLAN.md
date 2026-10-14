@@ -6,7 +6,7 @@
 shelling out.
 
 As of the last commit the write side does not exist. This section
-describes the finished tool, which is what a plan is for; "Status, as of the
+describes the finished tool, the thing a plan is for; "Status, as of the
 last commit" below says what the binary actually does, and the binary itself
 refuses the unimplemented modes instead of accepting them silently. The
 pointer is here because this was the first thing a reader saw and it read as
@@ -59,7 +59,7 @@ two modes, exit 2 for the four flags, instead of accepting them silently.
 `-x` in particular used to read the archive and return 0 having extracted
 nothing.
 
-The sections below describe the finished tool, which is what a plan is for.
+The sections below describe the finished tool, the thing a plan is for.
 Of the oracles, the `unzip`/`zipinfo` and `zipfile` read comparisons are
 wired up. Nothing writes an archive yet, so neither direction of the
 write-side differential exists, and the malicious-archive and truncation
@@ -117,7 +117,7 @@ are only ever invoked by `t/run.sh`.
    `-T` and `-x`. Every run must exit 2 and no run may die on a signal or
    fail to terminate.
 5. ASan + UBSan over the whole harness (`make test-asan`). We parse
-   attacker-controlled offsets and lengths out of a byte buffer, which is the
+   attacker-controlled offsets and lengths out of a byte buffer, the
    exact shape of problem that produces archiver CVEs.
 
 ## Non-goals
