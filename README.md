@@ -64,7 +64,7 @@ about an archive is worse than no answer:
 - Symlink members. Refused outright, which removes a whole class of
   extraction escape instead of trying to analyse it.
 
-The whole archive is read into memory. The format puts its index at the end,
+The whole archive is read into memory. That format puts its index at the end,
 so streaming would be a pretence; `PLAN.md` says so instead of implying
 otherwise.
 
