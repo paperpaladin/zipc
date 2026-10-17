@@ -17,7 +17,13 @@ test: zipc
 # sanitiser abort exits 1 by default and the harness reads "exit 1" as "cleanly
 # refused", so without it test-asan could not fail.  UBSan only prints unless
 # told to halt.
-SANOPT = ASAN_OPTIONS=exitcode=86 \
+# detect_leaks=0 because zipc deliberately never frees: it reads one archive
+# and exits, so the central directory it allocates is still live at exit and
+# LeakSanitizer reports it on every successful run.  Without this the gate was
+# red from the first commit, 30 of its 69 assertions failing on exit 86, which
+# is why nothing had ever read its output.  What the sanitiser is here for is
+# the out-of-bounds read on an attacker-chosen offset, and that still halts.
+SANOPT = ASAN_OPTIONS=exitcode=86:detect_leaks=0 \
 	 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:exitcode=86
 
 test-asan: zipc.c

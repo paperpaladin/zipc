@@ -511,7 +511,18 @@ static void slurp(const char *name)
 	}
 	if (fd)
 		close(fd);
-	abuf = b.p;
+	/* Shrink to exactly the archive length.  bneed() rounds the capacity
+	 * up to the next power of two from 64 KiB, so without this the buffer
+	 * runs tens of kilobytes past the end of the file and a read a few
+	 * bytes beyond `alen` lands in memory the allocator owns.  ASan cannot
+	 * see that, and the whole reason this program is built under ASan is
+	 * the read just past a length taken from the archive: an off-by-two
+	 * planted in the backwards scan was invisible to the sanitiser until
+	 * this realloc existed. */
+	uint8_t *q = realloc(b.p, b.n ? b.n : 1);
+	if (!q)
+		die("out of memory");
+	abuf = q;
 	alen = b.n;
 }
 

@@ -53,43 +53,86 @@ echo there >"$TMP/s/sub/b.txt"
 (cd "$TMP" && zip -q -r plain.zip s)
 
 nent() { "$ZIPC" -tf "$1" 2>/dev/null | wc -l; }
+# Member names, sorted, from each reader.  Comparing names and not counts
+# matters: two readers that both fail print nothing, and nothing equals
+# nothing.  The count form of the comment test below passed with find_end
+# deleted, because the plain archive it was compared against went to zero
+# at the same time.
+zc_names() { "$ZIPC" -tf "$1" 2>/dev/null | LC_ALL=C sort; }
+uz_names() { unzip -Z1 "$1" 2>/dev/null | LC_ALL=C sort; }
 
 assert "zip wrote something unzip likes" unzip -t "$TMP/plain.zip"
 eq "EOCD: entry count matches unzip" "$(nent "$TMP/plain.zip")" \
 	"$(unzip -l "$TMP/plain.zip" | tail -1 | awk '{print $2}')"
+eq "EOCD: member names match unzip" "$(zc_names "$TMP/plain.zip")" \
+	"$(uz_names "$TMP/plain.zip")"
 
 # A comment pushes the EOCD away from the end of the file.
 (cd "$TMP" && cp plain.zip commented.zip && \
 	printf 'a comment with some length to it' | zip -q -z commented.zip)
-eq "EOCD: found behind a comment" "$(nent "$TMP/commented.zip")" "$(nent "$TMP/plain.zip")"
+eq "EOCD: found behind a comment" "$(zc_names "$TMP/commented.zip")" \
+	"$(uz_names "$TMP/plain.zip")"
 assert "EOCD: unzip agrees the commented archive is fine" unzip -t "$TMP/commented.zip"
 
-# The signature appearing inside the comment.  Two versions: one where the
-# comment-length filter alone settles it, and one crafted so that only the
-# "does this offset point at a central directory header" filter does.
-python3 "$ORACLE" craft eocd-in-comment-mild "$TMP/decoy-mild.zip" >/dev/null
-eq "EOCD: signature inside a comment, mild -- right member count" \
-	"$(nent "$TMP/decoy-mild.zip")" 1
-# Both oracles lose here, and it took building the archive to find out:
-# Info-ZIP scans backwards for the signature and then simply believes the
-# twenty-two bytes that follow, and zipfile does the same, so *any* EOCD
-# signature anywhere in a comment defeats both of them.  zipc requires the
-# comment length to account for the rest of the file and the directory offset
-# to land on a central header, and so reads the archive its author meant.
-# Asserted as a divergence rather than skipped, so that the day Info-ZIP
-# fixes this, the suite says so instead of quietly agreeing.
-refute "EOCD: unzip cannot read the mild decoy (known divergence)" \
-	unzip -t "$TMP/decoy-mild.zip"
-refute "EOCD: zipfile cannot read the mild decoy either (known divergence)" \
-	python3 "$ORACLE" testzip "$TMP/decoy-mild.zip"
+# The signature inside the comment, written by Info-ZIP's own zip -z, so the
+# archive is one the format's own tool produces rather than one only a forge
+# can make.  Where the signature sits decides whether unzip survives it:
+# unzip takes the last occurrence that has 22 bytes of file after it, so a
+# decoy nearer the end than that is skipped and the real record is found.
+(cd "$TMP" && cp plain.zip near.zip && \
+	printf 'decoy PK\005\006 tail' | zip -q -z near.zip)
+assert "EOCD: zip -z wrote a signature-bearing comment unzip still reads" \
+	unzip -t "$TMP/near.zip"
+eq "EOCD: signature in the comment, near the end: names match unzip" \
+	"$(zc_names "$TMP/near.zip")" "$(uz_names "$TMP/near.zip")"
+eq "EOCD: ... and match the same archive without the comment" \
+	"$(zc_names "$TMP/near.zip")" "$(uz_names "$TMP/plain.zip")"
+# zipfile does not survive it.  _EndRecData takes the last occurrence of the
+# signature with rfind(), finds 12 bytes of record where it wants 22, and
+# gives up instead of scanning on, so it refuses an archive Info-ZIP wrote
+# and Info-ZIP reads.
+refute "EOCD: zipfile refuses it (known divergence)" \
+	python3 "$ORACLE" testzip "$TMP/near.zip"
 
+# Same writer, same comment, signature moved further from the end: now unzip
+# itself latches onto the decoy.  Info-ZIP writes an archive Info-ZIP cannot
+# read.  zipc requires the comment length to account for exactly the bytes
+# after the record, which the decoy's does not, so it reads the archive its
+# author meant.  Asserted as a divergence rather than skipped, so the day
+# Info-ZIP fixes this the suite says so instead of quietly agreeing.
+(cd "$TMP" && cp plain.zip far.zip && \
+	printf 'decoy PK\005\006 and a tail long enough to keep going' | \
+	zip -q -z far.zip)
+refute "EOCD: unzip cannot read its own far decoy (known divergence)" \
+	unzip -t "$TMP/far.zip"
+refute "EOCD: zipfile cannot read it either (known divergence)" \
+	python3 "$ORACLE" testzip "$TMP/far.zip"
+# Compared against unzip's reading of the same archive without the comment,
+# not against zipc's own: two readers that both fail print nothing, and the
+# first version of this line passed with find_end deleted.
+eq "EOCD: zipc reads the far decoy, names as unzip reads them uncommented" \
+	"$(zc_names "$TMP/far.zip")" "$(uz_names "$TMP/plain.zip")"
+
+# The decoy as the final 22 bytes of the file: its own comment-length field
+# is 0, which is correct for where it sits, so the length filter passes it
+# and only "does this offset point at a central directory header" rejects it.
 python3 "$ORACLE" craft eocd-in-comment "$TMP/decoy.zip" >/dev/null
-eq "EOCD: decoy as the final 22 bytes -- right member count" \
-	"$(nent "$TMP/decoy.zip")" 1
+eq "EOCD: decoy as the final 22 bytes: right member" \
+	"$(zc_names "$TMP/decoy.zip")" "real.txt"
 refute "EOCD: unzip cannot read the adversarial decoy (known divergence)" \
 	unzip -t "$TMP/decoy.zip"
 refute "EOCD: zipfile cannot read it either (known divergence)" \
 	python3 "$ORACLE" testzip "$TMP/decoy.zip"
+
+# Same position, but with counts saturated the way Zip64 spells them, so the
+# plausibility filter has nothing to judge and the comment length is the only
+# thing left that is wrong.  Without this archive, deleting the length check
+# passed all 74 of the other assertions.
+python3 "$ORACLE" craft eocd-in-comment-saturated "$TMP/sat.zip" >/dev/null
+eq "EOCD: a saturated decoy is rejected on its comment length" \
+	"$(zc_names "$TMP/sat.zip")" "real.txt"
+refute "EOCD: unzip cannot read the saturated decoy (known divergence)" \
+	unzip -t "$TMP/sat.zip"
 
 # Not an archive at all, and an archive too short to hold an EOCD.
 head -c 100 /dev/urandom >"$TMP/noise.bin"

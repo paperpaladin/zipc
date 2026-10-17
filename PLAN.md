@@ -118,7 +118,11 @@ are only ever invoked by `t/run.sh`.
    fail to terminate.
 5. ASan + UBSan over the whole harness (`make test-asan`). We parse
    attacker-controlled offsets and lengths out of a byte buffer, the
-   exact shape of problem that produces archiver CVEs.
+   exact shape of problem that produces archiver CVEs. This one was listed
+   here for several commits while being both red (LeakSanitizer, on every
+   successful run) and blind (the archive buffer was rounded up to a power
+   of two, so a read past the end of the file was inside the allocation).
+   Both are fixed; see the EOCD item below for how that came out.
 
 ## Non-goals
 
@@ -144,12 +148,53 @@ are only ever invoked by `t/run.sh`.
 - [x] skeleton: buffer, CRC-32, usage, Makefile, an empty harness
       why: the harness has to exist and be seen to print "0 failed" before
       anything claims to pass it.
-- [ ] end-of-central-directory location by backwards scan
-- [ ] central directory parse and `-t` listing
-- [ ] local file headers, and the disagreement check against the central dir
-- [ ] stored extraction
-- [ ] deflate extraction, decoder vendored from ../inflate
-- [ ] CRC-32 verification and `-T`
+- [x] end-of-central-directory location by backwards scan
+      files: zipc.c (find_end, cd_plausible, slurp), t/run.sh section 1,
+      t/oracle.py (craft_eocd_in_comment, craft_eocd_in_comment_saturated),
+      Makefile (SANOPT)
+      proves: eight assertions, all of them watched failing against a
+      find_end that cannot find anything. Info-ZIP `zip -z` writes the
+      interesting archive itself, so the hard case is not a forgery: a
+      comment holding 0x06054b50 within 22 bytes of the end is read by
+      `unzip` and by zipc with the same member list, name for name.
+      found: Info-ZIP writes an archive Info-ZIP cannot read. Move the same
+      decoy further from the end and `unzip -t` exits 3 on its own output,
+      because its scan takes the last signature with 22 bytes of file after
+      it and never checks the comment length. Python's zipfile is worse: its
+      rfind() finds one occurrence, sees too few bytes, and gives up rather
+      than scanning on, so it refuses the near-end archive unzip reads.
+      Both are asserted as divergences, not skipped.
+      found: the old comment test compared two member counts, and both went
+      to zero together when find_end was deleted, so it passed against a
+      reader that found nothing. Every assertion in the section now compares
+      names, and against unzip's names where it can.
+      found: the comment-length filter was dead weight as far as the suite
+      was concerned. Deleting it passed all 74 other assertions, because
+      cd_plausible caught every decoy on its own. The saturated decoy
+      (0xFFFF counts, which cd_plausible must pass through to Zip64) is the
+      archive that makes it load-bearing.
+      found: `make test-asan` had been red since the first commit, 30 of 69
+      assertions failing on LeakSanitizer alone, so nothing had ever read
+      its output. zipc never frees on purpose; detect_leaks=0.
+      found: and once it ran, it could not see the bug it exists for. slurp
+      rounded its buffer up to the next power of two, so a read past the end
+      of the archive landed in memory the allocator owned. An off-by-three
+      in the backwards scan reported 76 passed under ASan. slurp now
+      reallocs down to the archive length and the same defect is a
+      heap-buffer-overflow.
+- [x] central directory parse and `-t` listing
+      done in d62fb80; `-t`, `-tv` and `-tvv` diffed against zipinfo -v and
+      zipfile. These five boxes were left unticked by the commits that
+      closed them, which is why this item was picked up a second time.
+- [x] local file headers, and the disagreement check against the central dir
+      done in 472c998
+- [x] stored extraction
+      done in 9bcac44
+- [x] deflate extraction, decoder vendored from ../inflate
+      done in 352747c
+- [x] CRC-32 verification and `-T`
+      done in 352747c; crc_agree compares the CRC zipc computes against the
+      one zipinfo -v reports, which Info-ZIP wrote.
 - [ ] the path resolver and its refusals
 - [ ] the zip bomb caps
 - [ ] `-c` writing stored members

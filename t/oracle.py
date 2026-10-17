@@ -280,6 +280,11 @@ def craft_eocd_in_comment(path):
     its own that is consistent with the end of the file, so only the "does
     this point at a central directory" filter rejects it.
 
+    The easier version of this, where the signature sits in the middle of a
+    comment and the length filter alone settles it, needs no forge at all:
+    t/run.sh builds it with `zip -z`, which is a stronger statement than
+    this file can make.
+
     Layout, 22 bytes exactly: signature, then disk numbers and counts chosen
     to look plausible, then a zero comment length -- which is correct for a
     decoy sitting 22 bytes from the end of the file.
@@ -300,17 +305,31 @@ def craft_eocd_in_comment(path):
     assert data.count(SIG_EOCD) >= 2, 'decoy signature is not in the file'
 
 
-def craft_eocd_in_comment_mild(path):
-    """The signature in the comment, but not as the last 22 bytes, so the
-    comment-length filter alone settles it.  Info-ZIP and zipfile both read
-    this one correctly; the adversarial version above they do not, which is
-    the only place the three implementations disagree.
+def craft_eocd_in_comment_saturated(path):
+    """A decoy as the final 22 bytes again, but with every count saturated
+    the way Zip64 spells them, and a comment length that is a lie.
+
+    This is the one the "does it point at a central directory" filter cannot
+    catch: 0xFFFF entries and 0xFFFFFFFF offsets mean "look in the Zip64
+    record", so no reader can judge the offset from this record alone.  What
+    gives the decoy away is its comment length, which claims five bytes
+    follow it when nothing does.  That filter is otherwise redundant with the
+    plausibility one, and deleting it survived the whole suite until this
+    archive existed.
     """
-    _raw(path, [('real.txt', b'the real member\n', 8)],
-         comment=b'look: ' + SIG_EOCD + b' and more text after it, '
-         b'so the decoy is nowhere near the end of the file')
+    _raw(path, [('real.txt', b'the real member\n', 8)])
+    decoy = SIG_EOCD + struct.pack('<HHHHIIH',
+                                   0, 0,	# disk, cd start disk
+                                   0xFFFF, 0xFFFF,	# entries here, total
+                                   0xFFFFFFFF,		# cd size
+                                   0xFFFFFFFF,		# cd offset
+                                   5)		# comment length: a lie,
+						# nothing follows the record
+    assert len(decoy) == 22, len(decoy)
+    with zipfile.ZipFile(path, 'a') as z:
+        z.comment = decoy
     data = open(path, 'rb').read()
-    assert data.count(SIG_EOCD) >= 2, 'decoy signature is not in the file'
+    assert data.endswith(decoy), 'decoy is not the last 22 bytes'
 
 
 def craft_bomb_declared(path):
