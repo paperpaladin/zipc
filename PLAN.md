@@ -50,19 +50,30 @@ not parseable.
 
 ## Status, as of the last commit
 
-The read side works and the write side does not exist. `-t` lists the central
-directory and `-T` decompresses every member and checks its CRC-32, both
-compared against `unzip`, `zipinfo -v` and Python's `zipfile` over archives
-written by `zip` at every compression level. `-c`, `-x`, `-C`, `-0`, `-D` and
-`-Z` are not implemented, and the binary now refuses them, exit 3 for the
-two modes, exit 2 for the four flags, instead of accepting them silently.
-`-x` in particular used to read the archive and return 0 having extracted
-nothing.
+The read side works, and the write side writes stored members only. `-t`
+lists the central directory and `-T` decompresses every member and checks
+its CRC-32, both compared against `unzip`, `zipinfo -v` and Python's
+`zipfile` over archives written by `zip` at every compression level.
 
-The sections below describe the finished tool, the thing a plan is for.
-Of the oracles, the `unzip`/`zipinfo` and `zipfile` read comparisons are
-wired up. Nothing writes an archive yet, so neither direction of the
-write-side differential exists, and the malicious-archive and truncation
+`-c -0` writes an archive of a tree: local headers, member data, the
+central directory and the EOCD, directories recursed in sorted order.
+Info-ZIP `unzip -t` accepts it, `unzip` and `zipfile` both extract it to a
+tree `diff -r` says is identical to the input, `zipfile.testzip()` returns
+None, and every name, CRC-32 and size in our directory matches the one
+Info-ZIP's own `zip -0` computes for the same tree. So the round trip now
+exists in both directions, which is what the rest of the write side can be
+graded against.
+
+`-c` without `-0` exits 3: the contract says it deflates with a per-member
+fallback to stored, and the deflater is not written, so storing silently
+under a flag that promises deflate is refused rather than done. `-x`, `-C`,
+`-D` and `-Z` are still not implemented, exit 3 for the mode and exit 2 for
+the flags. Writing anything that would need Zip64 (a member or an archive
+over 4 GB, or more than 65534 members) exits 3 before a byte is written
+rather than truncating a size field.
+
+Of the oracles, both directions of the `unzip`/`zipinfo` and `zipfile`
+differentials are wired up for STORE. The malicious-archive and truncation
 sweeps are item 17.
 
 ## Hard invariant
@@ -197,7 +208,40 @@ are only ever invoked by `t/run.sh`.
       one zipinfo -v reports, which Info-ZIP wrote.
 - [ ] the path resolver and its refusals
 - [ ] the zip bomb caps
-- [ ] `-c` writing stored members
+- [x] `-c` writing stored members
+      files: zipc.c (emit, add_path, finish, dos_from, utf8_name,
+      unsafe_name, read_whole, top_name), t/run.sh section 6,
+      t/oracle.py (flags, rawnames, tree)
+      proves: 44 new assertions over oracle.py's round-trip tree, which is
+      the corpus rule for this repo: a 5 MB file, a 1.6 MB file that
+      compresses to almost nothing, 300 KB of urandom that does not
+      compress at all, a file of every byte value, an empty file, an empty
+      directory, a 200-character path, a name with a space, and a name
+      with a diaeresis. unzip -t accepts the archive, unzip and zipfile
+      both extract it to a tree diff -r calls identical, testzip() returns
+      None, and the whole name/CRC/size table matches what Info-ZIP's own
+      zip -0 computes over the same tree.
+      found: oracle.py's cmd_tree, written several commits ago and never
+      called, had a wrong length assertion in it (the 200-character path
+      is 196) and died a third of the way through building the tree. The
+      first version of this section ran against a corpus with the three
+      largest files missing and passed everything. The harness now checks
+      the forge's exit status and counts the files it made.
+      found: UBSan caught qsort(NULL, 0, ...) on the empty directory. The
+      -O2 build sorts it without complaint; this is the same trap bwrite()
+      already documents for memcpy.
+      found: Info-ZIP's unzip -t does not compare the central directory's
+      compressed size against the local header's. A mutation that writes
+      csize+1 in the directory only, leaving the data and the local header
+      correct, is accepted by unzip -t and by zipfile, and is caught by
+      zipc -T and by the cross-check against zip -0's own numbers. That is
+      invariant 1 earning its keep: zipc extracts from the directory, so a
+      directory that disagrees with the member is a refusal here.
+      found: 13 mutations planted, 13 caught. The one that needed a new
+      assertion was deleting the sort: readdir order is stable within a
+      run, so the two-runs-are-identical check could not see it, and
+      Info-ZIP is no oracle for member order either (zip -r writes files
+      before subdirectories, in neither sorted nor readdir order).
 - [ ] `-c` deflating, with per-member fallback to stored
 - [ ] data descriptors, read and `-D` write
 - [ ] Zip64: extra field, EOCD record, locator, and `-Z`

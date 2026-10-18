@@ -79,6 +79,33 @@ def cmd_verify(path, tree):
     out('OK %d members' % len(names))
 
 
+def cmd_flags(path):
+    """name<TAB>general-purpose flag bits.  Bit 11 (0x0800) says the name is
+    UTF-8, and zipfile decodes the name as cp437 when it is clear, so this is
+    how the suite checks the flag is set on exactly the members that need
+    it."""
+    with zipfile.ZipFile(path) as z:
+        for i in z.infolist():
+            out('%s\t0x%04x' % (i.filename, i.flag_bits))
+
+
+def cmd_rawnames(path):
+    """Member names as the bytes they are stored as, with no decoding, one
+    per line in repr form.  zipfile has already decoded by the time namelist()
+    is called, so this reads the central directory by hand -- it is the only
+    way to ask what is actually in the file rather than what Python made of
+    it."""
+    data = open(path, 'rb').read()
+    i = 0
+    while True:
+        i = data.find(b'PK\x01\x02', i)
+        if i < 0:
+            break
+        nl = struct.unpack('<H', data[i + 28:i + 30])[0]
+        out(repr(data[i + 46:i + 46 + nl]))
+        i += 46
+
+
 def cmd_extract(path, dest):
     """zipfile extracts into dest.  Note that zipfile *sanitises* hostile
     names rather than refusing them, so this is only ever pointed at archives
@@ -528,11 +555,16 @@ def cmd_tree(d):
     wr('empty', b'')			# an empty file
     wr('binary.dat', bytes(range(256)) * 40 + b'\0\0\0')
     wr('sp ace.txt', b'spaces in the name\n')
+    # A name that is not ASCII.  Written as UTF-8 bytes, which is what the
+    # filesystem holds; the writer has to set general-purpose bit 11 or
+    # zipfile decodes the name as cp437 and extracts a different file name
+    # than the one that went in.
+    wr('n\u00f6n-ascii.txt', b'a diaeresis in the member name\n')
 
     # A 200-character member path.  Nothing in ZIP limits a name to 255, but
     # every path component must still be a legal filename, so it is built out
     # of many short components rather than one long one.
-    long = '/'.join(['dir%02d' % i for i in range(20)]) + '/' + 'n' * 76
+    long = '/'.join(['dir%02d' % i for i in range(20)]) + '/' + 'n' * 80
     assert len(long) == 200, len(long)
     mk(os.path.dirname(long))
     wr(long, b'two hundred characters of path\n')

@@ -957,6 +957,350 @@ static const char *member_bytes(const Ent *t, uint64_t data, Buf *o)
 	}
 }
 
+/* ============================== writing ================================= */
+
+/* The write side builds the whole archive in memory and writes it once, for
+ * the same reason the read side reads it all in: the central directory is at
+ * the end, so the offsets in it are not known until the data is placed.  A
+ * streaming writer would have to seek back, and PLAN.md lists streaming as a
+ * non-goal rather than pretending.
+ *
+ * Only STORE is written here.  The deflater is the next item, and `-c`
+ * without `-0` exits 3 rather than quietly storing what the contract says is
+ * deflated: an archive that is four times the size the caller expected is a
+ * wrong answer, not a slow one.
+ */
+static Buf arc;			/* local headers and member data, in order */
+static Buf cdir;		/* central directory, same order */
+static uint64_t nwrit;
+
+/* Zip64 is PLAN item 14.  Until it exists, anything that would need it is
+ * refused up front -- before a byte is written, since nothing leaves memory
+ * until the archive is complete -- because the alternative is writing a
+ * truncated size field and producing an archive that silently decodes to the
+ * wrong length. */
+static void nozip64(int over, const char *what)
+{
+	if (!over)
+		return;
+	fprintf(stderr, "%s: %s needs Zip64, which is not implemented yet "
+	        "(PLAN item 14)\n", prog, what);
+	exit(3);
+}
+
+/* MS-DOS date and time: year counted from 1980 in 7 bits, seconds in 5 bits
+ * so the resolution is two seconds.  Both ends of the range have to be
+ * clamped rather than wrapped: a 1970 mtime would otherwise encode as 2060,
+ * and the field has no way to say "out of range". */
+static void dos_from(time_t when, unsigned *date, unsigned *time_)
+{
+	struct tm tm;
+	if (!localtime_r(&when, &tm) || tm.tm_year < 80) {
+		*date = (1u << 5) | 1u;	/* 1980-01-01 */
+		*time_ = 0;
+		return;
+	}
+	if (tm.tm_year > 207) {
+		*date = (127u << 9) | (12u << 5) | 31u;	/* 2107-12-31 */
+		*time_ = (23u << 11) | (59u << 5) | 29u;
+		return;
+	}
+	*date = (unsigned)(tm.tm_year - 80) << 9 |
+	    (unsigned)(tm.tm_mon + 1) << 5 | (unsigned)tm.tm_mday;
+	*time_ = (unsigned)tm.tm_hour << 11 | (unsigned)tm.tm_min << 5 |
+	    (unsigned)tm.tm_sec / 2;
+}
+
+/* General-purpose bit 11 says the name is UTF-8.  PLAN.md's non-goal is about
+ * reading -- names come back as the bytes they were stored as -- but on the
+ * write side the flag is not optional: without it Python's zipfile decodes
+ * the name as cp437, so the two bytes of "n\xc3\xb6.txt" come back out as
+ * two separate characters and the file lands under a different name,
+ * so the round trip produces a different tree.  Info-ZIP's zip sets it the
+ * same way.  A name that is not valid UTF-8 is left unflagged and stays a
+ * byte string.
+ *
+ * shortcut: overlong forms and the 0xc0/0xc1/0xf5.. leads are rejected, but
+ * surrogate halves (ED A0..BF) are not, so a name containing one would be
+ * flagged UTF-8 and Python would refuse to decode it.  No filesystem this
+ * runs on produces such a name; tighten it if one does. */
+static int utf8_name(const char *s)
+{
+	const uint8_t *p = (const uint8_t *)s;
+	int high = 0;
+
+	while (*p) {
+		unsigned c = *p++;
+		if (c < 0x80)
+			continue;
+		high = 1;
+		int cont = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc2 ? 1 : -1;
+		if (cont < 0 || c > 0xf4)
+			return 0;
+		while (cont--)
+			if ((*p++ & 0xc0) != 0x80)
+				return 0;
+	}
+	return high;
+}
+
+/* Invariant 2 in PLAN.md says no member can ever be written outside the
+ * destination on extract.  The same rule applies here, one step earlier: an
+ * archive whose member names are absolute or climb out of the tree is a
+ * hostile archive whoever built it, and this tool is not going to be the one
+ * that produces it.  Refusal, not silent stripping -- `zip` strips the
+ * leading slash and warns, which leaves the caller with an archive whose
+ * contents do not match what they asked for. */
+static const char *unsafe_name(const char *n)
+{
+	if (!*n)
+		return "empty name";
+	if (*n == '/')
+		return "an absolute path";
+	for (const char *p = n; p;) {
+		if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || !p[2]))
+			return "a \"..\" component";
+		p = strchr(p, '/');
+		if (p)
+			p++;
+	}
+	return NULL;
+}
+
+/* Reads a whole file into b.  Returns 0 and leaves the caller to skip the
+ * member if it cannot be read: one unreadable file in a tree is exit 1 with
+ * the member missing, not a dead run. */
+static int read_whole(const char *path, Buf *b)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		warn_("%s: %s (skipped)", path, strerror(errno));
+		failures++;
+		return 0;
+	}
+	b->n = 0;
+	for (;;) {
+		bneed(b, 65536);
+		ssize_t r = read(fd, b->p + b->n, 65536);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			warn_("%s: %s (skipped)", path, strerror(errno));
+			failures++;
+			close(fd);
+			return 0;
+		}
+		if (!r)
+			break;
+		b->n += (size_t)r;
+	}
+	close(fd);
+	return 1;
+}
+
+/* One member: the local file header, the data, and the central directory
+ * record that will be appended after all of them.  The two records repeat
+ * most of their fields, and they are written from the same local variables
+ * here precisely so they cannot drift: a local header that disagrees with
+ * the directory is the thing member_data() exists to catch on the read
+ * side. */
+static void emit(const char *path, const char *name, int isdir,
+		 const struct stat *st)
+{
+	static Buf data;	/* reused: one member's bytes at a time */
+	uint32_t crc = 0;
+
+	data.n = 0;
+	if (!isdir && !read_whole(path, &data))
+		return;
+
+	size_t nl = strlen(name);
+	nozip64(data.n > 0xFFFFFFFFu, name);
+	nozip64(arc.n > 0xFFFFFFFFu, "the archive");
+	nozip64(nwrit >= 0xFFFFu, "this many members");
+	if (nl > 0xFFFF)
+		die("member name longer than 65535 bytes");
+	if (!isdir)
+		crc = crc32b(data.p, data.n);
+
+	unsigned dosdate, dostime;
+	dos_from(st->st_mtime, &dosdate, &dostime);
+	unsigned flags = utf8_name(name) ? 0x0800u : 0u;
+	uint32_t sz = (uint32_t)data.n;
+	uint64_t off = arc.n;
+
+	bu32(&arc, SIG_LOCAL);
+	bu16(&arc, 10);		/* version needed: 1.0, STORE, no Zip64 */
+	bu16(&arc, flags);
+	bu16(&arc, 0);		/* method 0, STORE */
+	bu16(&arc, dostime);
+	bu16(&arc, dosdate);
+	bu32(&arc, crc);
+	bu32(&arc, sz);		/* compressed == uncompressed, for STORE */
+	bu32(&arc, sz);
+	bu16(&arc, (unsigned)nl);
+	bu16(&arc, 0);		/* no extra field */
+	bwrite(&arc, name, nl);
+	bwrite(&arc, data.p, data.n);
+
+	bu32(&cdir, SIG_CENT);
+	/* Made by Unix (3) version 3.0, which is what tells unzip that the
+	 * high 16 bits of the external attributes are a st_mode. */
+	bu16(&cdir, 3 << 8 | 30);
+	bu16(&cdir, 10);
+	bu16(&cdir, flags);
+	bu16(&cdir, 0);
+	bu16(&cdir, dostime);
+	bu16(&cdir, dosdate);
+	bu32(&cdir, crc);
+	bu32(&cdir, sz);
+	bu32(&cdir, sz);
+	bu16(&cdir, (unsigned)nl);
+	bu16(&cdir, 0);		/* extra */
+	bu16(&cdir, 0);		/* comment */
+	bu16(&cdir, 0);		/* disk number */
+	bu16(&cdir, 0);		/* internal attributes */
+	bu32(&cdir, (uint32_t)(st->st_mode & 0xFFFFu) << 16 |
+	     (isdir ? 0x10u : 0u));
+	bu32(&cdir, (uint32_t)off);
+	bwrite(&cdir, name, nl);
+	nwrit++;
+}
+
+static int byname(const void *a, const void *b)
+{
+	return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Adds one path, recursing into directories in sorted order.  Sorted because
+ * readdir order is the filesystem's business and an archive that comes out
+ * different on two machines holding the same tree cannot be compared against
+ * anything. */
+static void add_path(const char *path, const char *name)
+{
+	const char *why = unsafe_name(name);
+	if (why) {
+		refuse(name, why);
+		return;
+	}
+
+	struct stat st;
+	if (lstat(path, &st) < 0) {
+		warn_("%s: %s (skipped)", path, strerror(errno));
+		failures++;
+		return;
+	}
+	if (S_ISLNK(st.st_mode)) {
+		/* PLAN.md refuses symlink members on extract.  Writing one
+		 * and refusing to read it back would be a round trip this
+		 * tool fails on its own output. */
+		refuse(name, "a symbolic link");
+		return;
+	}
+	if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) {
+		refuse(name, "not a regular file or directory");
+		return;
+	}
+	if (!S_ISDIR(st.st_mode)) {
+		emit(path, name, 0, &st);
+		return;
+	}
+
+	size_t nl = strlen(name);
+	char *dname = xmalloc(nl + 2);
+	memcpy(dname, name, nl);
+	dname[nl] = '/';	/* the trailing slash *is* the directory bit */
+	dname[nl + 1] = '\0';
+	emit(path, dname, 1, &st);
+	free(dname);
+
+	DIR *d = opendir(path);
+	if (!d) {
+		warn_("%s: %s (contents skipped)", path, strerror(errno));
+		failures++;
+		return;
+	}
+	char **kid = NULL;
+	size_t nk = 0, cap = 0;
+	for (struct dirent *de; (de = readdir(d));) {
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+			continue;
+		if (nk == cap) {
+			cap = cap ? cap * 2 : 16;
+			char **q = realloc(kid, cap * sizeof *q);
+			if (!q)
+				die("out of memory");
+			kid = q;
+		}
+		kid[nk] = xmalloc(strlen(de->d_name) + 1);
+		strcpy(kid[nk++], de->d_name);
+	}
+	closedir(d);
+	/* An empty directory leaves kid NULL, and qsort(NULL, 0, ...) is
+	 * undefined even though it sorts nothing -- the same trap bwrite()
+	 * documents for memcpy.  UBSan caught this one, on the empty
+	 * directory in oracle.py's round-trip tree; the -O2 build sorted it
+	 * without complaint. */
+	if (nk)
+		qsort(kid, nk, sizeof *kid, byname);
+	for (size_t i = 0; i < nk; i++) {
+		size_t pl = strlen(path), kl = strlen(kid[i]);
+		char *p2 = xmalloc(pl + kl + 2), *n2 = xmalloc(nl + kl + 2);
+		sprintf(p2, "%s/%s", path, kid[i]);
+		sprintf(n2, "%s/%s", name, kid[i]);
+		add_path(p2, n2);
+		free(p2);
+		free(n2);
+		free(kid[i]);
+	}
+	free(kid);
+}
+
+/* The end of the archive: the central directory, then the EOCD record. */
+static void finish(const char *name)
+{
+	uint64_t cdoff = arc.n, cdsize = cdir.n;
+
+	nozip64(cdoff > 0xFFFFFFFFu, "the archive");
+	bwrite(&arc, cdir.p, cdir.n);
+	bu32(&arc, SIG_EOCD);
+	bu16(&arc, 0);		/* this disk */
+	bu16(&arc, 0);		/* disk with the central directory */
+	bu16(&arc, (unsigned)nwrit);	/* entries on this disk */
+	bu16(&arc, (unsigned)nwrit);	/* entries in total */
+	bu32(&arc, (uint32_t)cdsize);
+	bu32(&arc, (uint32_t)cdoff);
+	bu16(&arc, 0);		/* no archive comment */
+
+	FILE *f = stdout;
+	if (name && strcmp(name, "-") != 0) {
+		f = fopen(name, "wb");
+		if (!f)
+			bad("%s: %s", name, strerror(errno));
+	}
+	if (arc.n && fwrite(arc.p, 1, arc.n, f) != arc.n)
+		die("write failed");
+	if (f == stdout ? fflush(f) != 0 : fclose(f) != 0)
+		die("write failed");
+}
+
+/* The name a path is stored under: "./s/a" and "s/a/" both become "s/a", so
+ * that `zipc -c0 ./s` and `zipc -c0 s/` produce the same archive.  Anything
+ * else about the path is kept, including a leading slash, which unsafe_name
+ * then refuses. */
+static char *top_name(const char *path)
+{
+	while (path[0] == '.' && path[1] == '/')
+		path += 2;
+	size_t n = strlen(path);
+	while (n > 1 && path[n - 1] == '/')
+		n--;
+	char *r = xmalloc(n + 1);
+	memcpy(r, path, n);
+	r[n] = '\0';
+	return r;
+}
+
 /* ================================== main ================================ */
 
 /* The usage text lists what is built, and lists the rest under "not yet".
@@ -966,19 +1310,21 @@ static const char *member_bytes(const Ent *t, uint64_t data, Buf *o)
  * and did nothing. A usage message is a promise about the binary it ships
  * with, not about the plan. */
 static const char USAGE[] =
-    "usage: zipc -t|-T [-v] [-f ARCHIVE]\n"
+    "usage: zipc -c0 [-f ARCHIVE] PATH... | zipc -t|-T [-v] [-f ARCHIVE]\n"
+    "  -c  create an archive of PATH..., directories recursed in sorted order\n"
+    "  -0  store, do not deflate; required by -c until the deflater exists\n"
     "  -t  list the central directory; -tv long-form\n"
     "  -T  test: decompress every member and check its CRC-32, write nothing\n"
-    "  -f  archive file; '-' or omitted means stdin\n"
+    "  -f  archive file; '-' or omitted means stdin for -t/-T, stdout for -c\n"
     "not implemented yet, and refused rather than ignored:\n"
-    "  -c  create an archive        -x  extract        -C DIR  extract into DIR\n"
-    "  -0  store, do not deflate    -D  data descriptors   -Z  force Zip64\n"
+    "  deflating (-c without -0)    -x  extract        -C DIR  extract into DIR\n"
+    "  -D  data descriptors         -Z  force Zip64\n"
     "exit 0 on success, 1 if a member was refused or skipped, 2 if the\n"
     "archive is not parseable, 3 if the mode asked for is not implemented.\n";
 
 int main(int argc, char **argv)
 {
-	int mode = 0, verbose = 0;
+	int mode = 0, verbose = 0, store = 0;
 	const char *arcname = NULL;
 
 	crcinit();
@@ -995,6 +1341,9 @@ int main(int argc, char **argv)
 				break;
 			case 'v':
 				verbose++;
+				break;
+			case '0':
+				store = 1;
 				break;
 			case 'f':
 				if (s[1])
@@ -1014,36 +1363,49 @@ int main(int argc, char **argv)
 		}
 	}
 
-	(void)crc32b;
-	(void)bu16;
-	(void)bu32;
-	(void)bu64;
-	(void)bwrite;
-	(void)xmalloc;
-	(void)warn_;
-	(void)refuse;
+	(void)bu64;		/* Zip64 write, PLAN item 14 */
 
 	if (!mode) {
 		fputs(USAGE, stderr);
 		return 2;
 	}
 
-	/* -c and -x parse but are not written yet, and everything below this
-	 * point reads an archive. So -c used to slurp the archive it had been
-	 * asked to create ("zipc: too short to be a zip archive (0 bytes)",
-	 * or "No such file or directory" with -f), and -x used to read the
-	 * archive, build the central directory, match neither branch below,
-	 * and return 0 -- extracting nothing and reporting success, which a
-	 * caller in a script cannot tell from having extracted everything.
-	 * Exit 3 says "not implemented" in a way that is not a diagnostic
-	 * about the input, the same separation xmlc needed. */
-	if (mode == 'c' || mode == 'x') {
-		fprintf(stderr, "zipc: -%c is not implemented yet"
-		        " (PLAN item %s)\n", mode,
-		        mode == 'c' ? "11, -c writing stored members"
-		                    : "05, stored extraction");
+	/* -x parses but is not written yet, and everything below this point
+	 * reads an archive, so -x used to read the archive, build the central
+	 * directory, match neither branch below, and return 0 -- extracting
+	 * nothing and reporting success, which a caller in a script cannot
+	 * tell from having extracted everything.  Exit 3 says "not
+	 * implemented" in a way that is not a diagnostic about the input, the
+	 * same separation xmlc needed. */
+	if (mode == 'x') {
+		fprintf(stderr, "zipc: -x is not implemented yet"
+		        " (PLAN item 05, stored extraction)\n");
 		return 3;
 	}
+	if (mode == 'c') {
+		/* The contract says -c deflates and falls back to STORE per
+		 * member.  Only the STORE half is written, so -c without -0
+		 * refuses instead of quietly producing an archive several
+		 * times the size the caller asked for. */
+		if (!store) {
+			fprintf(stderr, "zipc: deflating is not implemented "
+			        "yet (PLAN item 12); pass -0 to store\n");
+			return 3;
+		}
+		if (i >= argc)
+			bad("-c needs at least one path to put in the archive");
+		for (; i < argc; i++) {
+			char *nm = top_name(argv[i]);
+			add_path(argv[i], nm);
+			free(nm);
+		}
+		finish(arcname);
+		return failures ? 1 : 0;
+	}
+	/* -0 changes how members are written and has nothing to say about
+	 * reading one, so it is an error rather than a no-op on -t/-T. */
+	if (store)
+		bad("-0 only means anything with -c");
 
 	slurp(arcname);
 	End e;

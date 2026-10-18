@@ -310,26 +310,203 @@ assert "DEFLATE: ... and says it was truncated" grep -q truncated "$TMP/dcut.err
 refute "DEFLATE: unzip -t rejects it too" unzip -t "$TMP/dcut.zip"
 
 # --------------------------------------------------------------------- #
+# 6. writing: -c -0, stored members                                     #
+# --------------------------------------------------------------------- #
+# The point of this section is that the archive is graded by programs that
+# did not write it.  zipc reading its own output proves only that one
+# program agrees with itself, so that check is last and is labelled as what
+# it is; everything above it is unzip, zipinfo and zipfile.
+#
+# oracle.py's `tree` is the corpus: an empty file, an empty directory, a
+# 200-character path, a file with spaces, a file of every byte value, a
+# 300 KB file that compresses badly, a 1.6 MB one that compresses extremely
+# well, a 5 MB one in between, and a name with a diaeresis in it.  A round
+# trip over an empty archive, or one file of no bytes, would pass against
+# almost any defect.
+mkdir -p "$TMP/wt"
+# Checked, not just run: cmd_tree had a wrong length assertion in it and
+# died half way through building the tree, leaving the three largest files
+# out.  Nothing noticed, because the exit status of the forge was thrown
+# away and every assertion below still passed over the smaller corpus.
+assert "write: the round-trip tree was built" \
+	python3 "$ORACLE" tree "$TMP/wt/w"
+eq "write: ... with all ten files in it" \
+	"$(find "$TMP/wt/w" -type f | wc -l)" 10
+(cd "$TMP/wt" && "$ZIPC" -c0 -f ../w.zip w) 2>"$TMP/w.err"
+eq "write: -c0 exits 0" "$?" 0
+eq "write: ... and says nothing on stderr" "$(cat "$TMP/w.err")" ""
+
+assert "write: unzip -t accepts the archive" unzip -tqq "$TMP/w.zip"
+eq "write: zipfile testzip finds no bad member" \
+	"$(python3 "$ORACLE" testzip "$TMP/w.zip")" OK
+
+# The central directory we wrote, read back by both oracles and by zipc, all
+# three compared field for field.
+cd_agree "write" "$TMP/w.zip"
+
+# Content, not just structure.  Two independent extractors, each diffed
+# against the tree that went in: this is the round trip.
+mkdir -p "$TMP/ux"
+assert "write: unzip extracts it" unzip -qq -o -d "$TMP/ux" "$TMP/w.zip"
+assert "write: ... to a tree identical to the input" diff -r "$TMP/wt" "$TMP/ux"
+python3 "$ORACLE" extract "$TMP/w.zip" "$TMP/px" >/dev/null
+assert "write: zipfile extracts to an identical tree too" \
+	diff -r "$TMP/wt" "$TMP/px"
+assert "write: zipfile read() equals the file on disk, member by member" \
+	python3 "$ORACLE" verify "$TMP/w.zip" "$TMP/wt"
+
+# Every CRC and size we wrote, against the ones Info-ZIP computes for the
+# same tree.  zip -0 stores too, so the member set and every content-derived
+# number must match exactly; only the offsets and the extra fields differ.
+# This is the check that the CRC in our directory is the file's CRC and not
+# merely a number our own reader agrees with.
+(cd "$TMP/wt" && rm -f ../iz.zip && zip -q -0 -X -r ../iz.zip w)
+crcsize() { zi_info "$1" | awk -F'\t' '{printf "%s\t%s\t%s\n",$1,$3,$5}' |
+	LC_ALL=C sort; }
+crcsize "$TMP/w.zip" >"$TMP/w.crc"
+crcsize "$TMP/iz.zip" >"$TMP/iz.crc"
+assert "write: every name, CRC and size matches Info-ZIP's own zip -0" \
+	diff -u "$TMP/iz.crc" "$TMP/w.crc"
+
+# Member order.  PLAN.md says directories are recursed in sorted order, and
+# the archive has to say so too: readdir order is the filesystem's business
+# and an archive of the same tree that comes out in a different order on
+# another machine cannot be compared with anything.  Info-ZIP is no oracle
+# for this -- zip -r writes files before subdirectories, in neither sorted
+# nor readdir order -- so this is our contract, read back by zipfile.
+python3 "$ORACLE" names "$TMP/w.zip" >"$TMP/w.order"
+assert "write: members are in sorted order, not readdir order" \
+	diff -u <(LC_ALL=C sort "$TMP/w.order") "$TMP/w.order"
+
+# The empty file has to survive: it is the member a writer most easily
+# drops, and a suite that only counts members would not see it.
+eq "write: the empty member is present and zero length" \
+	"$("$ZIPC" -tvvf "$TMP/w.zip" | awk -F'\t' '$1=="w/empty"{print $4" "$5}')" \
+	"0 0"
+eq "write: the empty directory is present, with a trailing slash" \
+	"$(unzip -Z1 "$TMP/w.zip" | grep -c '^w/emptydir/$')" 1
+
+# The non-ASCII name.  Without general-purpose bit 11 zipfile decodes the
+# name as cp437 and extracts a file called something else, so the diff above
+# would fail -- but only on that one member, which is why the flag is also
+# asserted directly.
+eq "write: bit 11 is set on the UTF-8 name" \
+	"$(python3 "$ORACLE" flags "$TMP/w.zip" | awk -F'\t' '/n..n-ascii/{print $2}')" \
+	"0x0800"
+eq "write: bit 11 is not set on the ASCII names" \
+	"$(python3 "$ORACLE" flags "$TMP/w.zip" | awk -F'\t' '$2!="0x0000"' | wc -l)" 1
+eq "write: unzip lists the non-ASCII name too" \
+	"$(unzip -Z1 "$TMP/w.zip" | LC_ALL=C grep -c 'n..n-ascii.txt')" 1
+
+# A name that is NOT valid UTF-8.  The filesystem will hold one, and the
+# format says a name is bytes, so zipc stores the bytes and leaves bit 11
+# clear.  unzip writes those bytes back out.  zipfile cannot: it decodes an
+# unflagged name as cp437, so Python's idea of the name differs from the
+# bytes in the file.  Asserted as a divergence rather than avoided.
+mkdir -p "$TMP/wl"
+printf 'latin-1, not utf-8\n' >"$TMP/wl/$(printf 'l\344tin1.txt')"
+(cd "$TMP" && "$ZIPC" -c0 -f l.zip wl) 2>/dev/null
+eq "latin1: zipc writes the name as bytes" \
+	"$(python3 "$ORACLE" rawnames "$TMP/l.zip" | grep -cF 'l\xe4tin1.txt')" 1
+eq "latin1: ... with bit 11 clear" \
+	"$(python3 "$ORACLE" flags "$TMP/l.zip" | awk -F'\t' '$2!="0x0000"' | wc -l)" 0
+assert "latin1: unzip -t accepts it" unzip -tqq "$TMP/l.zip"
+# zipfile opening it at all is the assertion that bit 11 was not set on a
+# name that is not UTF-8: with the flag on, zipfile raises decoding the
+# central directory and every check below it goes quietly vacuous.
+eq "latin1: zipfile can still open the archive" \
+	"$(python3 "$ORACLE" names "$TMP/l.zip" | wc -l)" 2
+mkdir -p "$TMP/lx"
+unzip -qq -o -d "$TMP/lx" "$TMP/l.zip"
+assert "latin1: unzip extracts the name byte for byte" diff -r "$TMP/wl" "$TMP/lx/wl"
+python3 "$ORACLE" extract "$TMP/l.zip" "$TMP/lp" >/dev/null
+refute "latin1: zipfile decodes it as cp437 instead, so its tree differs" \
+	diff -r "$TMP/wl" "$TMP/lp/wl"
+
+# DOS date and time.  Two fields, five bit-packed numbers, and a range that
+# starts in 1980, so the clamp is a branch that a tree of files created
+# today never reaches.
+touch -d '2001-02-03 04:05:06' "$TMP/wt/w/a/hello.txt"
+touch -d '@0' "$TMP/wt/w/empty"		# 1970, before the epoch of the field
+(cd "$TMP/wt" && "$ZIPC" -c0 -f ../wd.zip w)
+eq "write: the mtime is written as a DOS date and time" \
+	"$("$ZIPC" -tvf "$TMP/wd.zip" | awk '$NF=="w/a/hello.txt"{print $6" "$7}')" \
+	"2001-02-03 04:05:06"
+eq "write: a pre-1980 mtime is clamped to 1980-01-01, not wrapped" \
+	"$("$ZIPC" -tvf "$TMP/wd.zip" | awk '$NF=="w/empty"{print $6" "$7}')" \
+	"1980-01-01 00:00:00"
+eq "write: ... and unzip reads the same clamped date" \
+	"$(unzip -l "$TMP/wd.zip" | awk '$NF=="w/empty"{print $2}')" "1980-01-01"
+
+# Two runs over the same tree have to produce the same bytes, or nothing
+# downstream can be compared against anything.  readdir order is the
+# filesystem's business, which is why add_path sorts.
+(cd "$TMP/wt" && "$ZIPC" -c0 -f ../w2.zip w)
+assert "write: the same tree twice gives byte-identical archives" \
+	cmp "$TMP/wd.zip" "$TMP/w2.zip"
+# ... and the archive on stdout is the same archive.
+(cd "$TMP/wt" && "$ZIPC" -c0 w >../w3.zip)
+assert "write: -f FILE and stdout agree byte for byte" \
+	cmp "$TMP/wd.zip" "$TMP/w3.zip"
+
+# What -c refuses.  Invariant 2 in PLAN.md is about extraction, but an
+# archive full of names that climb out of the destination is one this tool
+# is not going to produce either.
+ln -sf /etc/hostname "$TMP/wt/w/link"
+for case in "abs:/etc/hostname:an absolute path" \
+	    "dotdot:../wt:a \"..\" component" \
+	    "link:w/link:a symbolic link"; do
+	tag=${case%%:*}; rest=${case#*:}; arg=${rest%%:*}; want=${rest#*:}
+	(cd "$TMP/wt" && "$ZIPC" -c0 -f "../ref.$tag.zip" "$arg") 2>"$TMP/ref.err"
+	eq "write: $tag is refused, exit 1" "$?" 1
+	assert "write: ... and says why: $want" \
+		grep -qF "REFUSING unsafe member" "$TMP/ref.err"
+	assert "write: ... naming the reason" grep -qF "$want" "$TMP/ref.err"
+done
+rm -f "$TMP/wt/w/link"
+# A refused member must not be in the archive either: the refusal is not
+# just a message printed beside the file being added anyway.
+eq "write: the refused symlink is not in the archive" \
+	"$(python3 "$ORACLE" names "$TMP/ref.link.zip" | wc -l)" 0
+
+(cd "$TMP/wt" && "$ZIPC" -c0 -f ../missing.zip w/nosuchfile) 2>"$TMP/ms.err"
+eq "write: an unreadable path exits 1" "$?" 1
+assert "write: ... and says it was skipped" grep -q skipped "$TMP/ms.err"
+
+# zipc reading its own output.  Last, and worth little on its own: it is
+# here so that a change that breaks both halves in the same direction still
+# has to get past the eleven oracle checks above.
+assert "write: zipc -T accepts its own archive (self-agreement only)" \
+	"$ZIPC" -Tf "$TMP/w.zip"
+
+# --------------------------------------------------------------------- #
 # The modes that are not written yet have to refuse, not pretend.
 #
 # -x used to be accepted, read the archive, match no branch, and return 0 --
 # extracting nothing while reporting success. A caller in a shell script
 # cannot tell that from a complete extraction, and this suite did not look.
-# -c used to slurp the archive it had been asked to create and fail with a
-# diagnostic about the *input* being unreadable.
 #
-# Each unimplemented mode is checked for its own exit status (3, distinct from
-# 1 "refused a member" and 2 "unparseable") and for naming itself, so neither
-# can quietly become an exit 0 again.
-for m in c x; do
-	"$ZIPC" "-$m" -f "$TMP/d9.zip" a >/dev/null 2>"$TMP/ni.err"
-	eq "-$m is not implemented and exits 3, not 0" "$?" 3
-	assert "-$m says which flag is missing" grep -q -- "-$m is not implemented" "$TMP/ni.err"
-done
+# -c now works, but only with -0: the contract says it deflates and falls
+# back to stored per member, and the deflater is the next item. Writing
+# stored data under a flag that promises deflate would hand the caller an
+# archive several times the size they asked for and call it success, so -c
+# without -0 is exit 3 as well.
+"$ZIPC" -x -f "$TMP/d9.zip" a >/dev/null 2>"$TMP/ni.err"
+eq "-x is not implemented and exits 3, not 0" "$?" 3
+assert "-x says which flag is missing" grep -q -- "-x is not implemented" "$TMP/ni.err"
+(cd "$TMP/wt" && "$ZIPC" -c -f ../nodefl.zip w) >/dev/null 2>"$TMP/nd.err"
+eq "-c without -0 exits 3 rather than storing silently" "$?" 3
+assert "-c without -0 says the deflater is missing" \
+	grep -q "deflating is not implemented" "$TMP/nd.err"
+refute "-c without -0 writes no archive at all" test -f "$TMP/nodefl.zip"
+"$ZIPC" -c0 -f "$TMP/noargs.zip" >/dev/null 2>"$TMP/na.err"
+eq "-c with no paths exits 2" "$?" 2
+"$ZIPC" -0 -tf "$TMP/d9.zip" >/dev/null 2>"$TMP/z0.err"
+eq "-0 on a read mode is an error, not a no-op" "$?" 2
 
 # A flag the parser does not handle must be refused, and the usage text must
-# not be advertising it. -C, -0, -D and -Z were all listed as if they worked.
-for m in C 0 D Z; do
+# not be advertising it. -C, -D and -Z were all listed as if they worked.
+for m in C D Z; do
 	"$ZIPC" "-$m" -tf "$TMP/d9.zip" >/dev/null 2>"$TMP/uf.err"
 	eq "-$m is refused rather than ignored" "$?" 2
 	refute "usage does not offer -$m as working" \
